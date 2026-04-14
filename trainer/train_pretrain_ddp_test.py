@@ -1,3 +1,13 @@
+'''
+该文件做单卡分布式测试使用，需要对代码做临时修改：
+由于只有一张卡，当 torchrun 拉起第二个进程时，它的 local_rank 会变成 1。如果代码按原逻辑执行 torch.cuda.set_device(1)，程序会直接报错“找不到设备”。
+标记🌟的部分是与原文件有改动的部分
+运行方法：
+第一步：如果是windows系统，临时关闭 libuv（只在当前窗口生效）：
+$env:USE_LIBUV=0
+第二步：运行分布式代码
+torchrun --nproc_per_node=2 train_pretrain.py
+'''
 import os
 import sys
 
@@ -30,9 +40,9 @@ if is_distributed:
     backend = "nccl" if torch.cuda.is_available() and os.name != 'nt' else "gloo"
     dist.init_process_group(backend=backend)
     
-    # 1.3 为当前进程绑定专属的 GPU 卡
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
+    # 🌟 修改点 1：不管 local_rank 是几，强行把它们都按在第 0 张卡上！
+    torch.cuda.set_device(0) 
+    device = torch.device("cuda:0")
 else:
     # 退化为单卡运行
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -45,7 +55,8 @@ if is_main_process:
 
 
 epochs = 2
-batch_size = 16
+# 🌟防止显存爆炸，batch_size改为1
+batch_size = 1
 lr = 5e-4
 use_compile = False  # 在 Windows 原生系统保持 False，Linux 下可改为 True。
 
@@ -59,7 +70,7 @@ if is_main_process:
             "batch_size": batch_size,
             "use_compile": use_compile,
             "learning_rate": lr,
-            "hidden_size": 512,
+            "hidden_size": 64,
             "num_layers": 6
         }
     )
@@ -89,7 +100,8 @@ if use_compile:
 if is_distributed:
     # 告诉 DDP 忽略掉 RoPE 的缓存参数，否则会报错
     model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
-    model = DDP(model, device_ids=[local_rank])
+    # 🌟 修改点 2：强行指定 device_ids 为 [0]
+    model = DDP(model, device_ids=[0])
 
 
 # ================= 5. 数据集与 DistributedSampler =================
