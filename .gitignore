@@ -1,0 +1,24 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 模型权重与检查点
+*.pth
+*.pt
+*.ckpt
+out/
+checkpoints/
+
+# 数据集
+*.jsonl
+*.csv
+*.txt
+
+# 日志和可视化 
+swanlog/
+wandb/
+
+# 虚拟环境 
+venv/
+env/
+.env
