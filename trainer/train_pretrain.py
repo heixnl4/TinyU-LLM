@@ -14,7 +14,7 @@ from torch.nn.utils import clip_grad_norm_
 from model.configuration import TinyuConfig
 from dataset.lm_dataset import PretrainDataset 
 from transformers import get_cosine_schedule_with_warmup
-from trainer.train_utils import print_model_param_details, init_model, set_seed
+from trainer.train_utils import print_model_param_details, init_model,  set_seed, save_checkpoint, load_checkpoint
 
 # 导入分布式计算需要的模块
 import torch.distributed as dist
@@ -128,17 +128,32 @@ scheduler = get_cosine_schedule_with_warmup(
 )
 
 # ================= 7. 训练循环 =================
+
+# 尝试加载 Checkpoint
+checkpoint_path = "../checkpoints/checkpoint_pretrain.pth"
+start_epoch, start_step = load_checkpoint(
+    model, optimizer, scheduler, scaler, checkpoint_path, device, is_distributed
+)
+
+if is_main_process and not start_epoch and not start_step:
+    print("没有找到 checkpoint，开始从零训练...") 
+    
 model.train()
 
 # 记录整个训练开始的时间
 start_time = time.time()
 
-for epoch in range(epochs):
+# 如果是恢复训练则从 start_epoch 开始，如果没有 checkpoint 则 start_epoch 默认为0
+for epoch in range(start_epoch, epochs):
     # 必须加上这句：让采样器打乱每个 epoch 的数据顺序
     if sampler is not None: 
         sampler.set_epoch(epoch)
 
     for step, (input_ids, labels) in enumerate(dataloader):
+        # 如果是恢复训练，跳过已经练过的 step
+        if epoch == start_epoch and step < start_step:
+            continue
+
         input_ids, labels = input_ids.to(device), labels.to(device)
         
         optimizer.zero_grad()
@@ -154,7 +169,7 @@ for epoch in range(epochs):
         
         # 反向传播，对 loss 进行缩放后再 backward
         scaler.scale(loss).backward()
-        # 梯度裁剪：必须在 unscale 之后进行！
+        # 梯度裁剪：必须在 unscale 之后进行
         scaler.unscale_(optimizer)
         clip_grad_norm_(model.parameters(), 1.0)
         # 更新权重和 Scaler
@@ -197,6 +212,13 @@ for epoch in range(epochs):
                 "train/elapsed_hours": elapsed_seconds / 3600 # 记录已跑的小时数
             })
             
+        # 保存一次 Checkpoint 
+        if step > 0 and step % 10 == 0 and is_main_process:
+            save_checkpoint(
+                model, optimizer, scheduler, scaler, epoch, step, 
+                checkpoint_path, is_distributed
+            )
+
     # 每轮跑完存一个模型
     # 只允许主进程保存，防止多个 GPU 抢占覆盖同一个文件
     if is_main_process:
