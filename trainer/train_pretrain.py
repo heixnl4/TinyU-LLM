@@ -4,6 +4,8 @@ import sys
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import time           # 用于记录时间戳
+import datetime       # 用于把秒数格式化成 时:分:秒
 import torch
 import swanlab 
 from torch import optim
@@ -121,6 +123,10 @@ scheduler = get_cosine_schedule_with_warmup(
 
 # ================= 7. 训练循环 =================
 model.train()
+
+# 记录整个训练开始的时间
+start_time = time.time()
+
 for epoch in range(epochs):
     # 必须加上这句：让采样器打乱每个 epoch 的数据顺序
     if sampler is not None: 
@@ -155,14 +161,34 @@ for epoch in range(epochs):
         if step % 100 == 0 and is_main_process:
             current_loss = loss.item()
             current_lr = optimizer.param_groups[0]['lr']  # 获取当前动态学习率
-            print(f"Epoch: {epoch}, Step: {step}, Loss: {current_loss:.4f}, LR: {current_lr:.6f}")
+
+            # 1. 计算当前全局进度
+            global_step = step + (epoch * len(dataloader))
+            # 为了防止第一步 global_step 为 0 导致除以零报错，强行设为 1
+            calc_step = global_step if global_step > 0 else 1
+
+            # 2. 计算耗时与 ETA
+            elapsed_seconds = time.time() - start_time                     # 已花费总秒数
+            steps_per_second = calc_step / elapsed_seconds                 # 每秒能跑多少步
+            remaining_steps = total_steps - global_step                    # 还剩多少步
+            eta_seconds = remaining_steps / steps_per_second               # 预计还剩多少秒
+
+            # 3. 格式化为 HH:MM:SS
+            elapsed_str = str(datetime.timedelta(seconds=int(elapsed_seconds)))
+            eta_str = str(datetime.timedelta(seconds=int(eta_seconds)))
+
+            # 4. 打印进度日志
+            print(f"Epoch: [{epoch+1}/{epochs}] | Step: [{global_step}/{total_steps}] | "
+                  f"Loss: {current_loss:.4f} | LR: {current_lr:.6f} | "
+                  f"已耗时: {elapsed_str} | 预计剩余: {eta_str}")
             
             # 把当前的数据画到 SwanLab 的折线图上
             swanlab.log({
                 "train/loss": current_loss,
                 "train/aux_loss": outputs.aux_loss.item() if outputs.aux_loss is not None else 0,
                 "train/learning_rate": current_lr,
-                "train/step": step + (epoch * len(dataloader)) # 记录全局 step
+                "train/step": global_step, # 记录全局 step
+                "train/elapsed_hours": elapsed_seconds / 3600 # 记录已跑的小时数
             })
             
     # 每轮跑完存一个模型
