@@ -12,7 +12,8 @@ def parse_args():
     parser.add_argument("--max_length", type=int, default=512, help="模型最大上下文长度")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--accumulation_steps", type=int, default=4, help="梯度累积步数")
-
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"], help="训练时使用的精度")
+    
     # ================= 2. 模型架构参数 =================
     # (预训练从零开始时需要，如果是 SFT 微调则可能直接从预训练权重读取，这里留作覆盖用)
     parser.add_argument("--hidden_size", type=int, default=256, help="隐藏层维度")

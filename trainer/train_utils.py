@@ -15,7 +15,7 @@ from model.model_Tinyu import TinyuForcausalLM
 
 # 打印模型参数
 def print_model_param_details(model, detail=False, prefix=""):
-    print("=== Detailed Parameter Count ===")
+    print(f"{'-'*50}")
     total_params = 0
     for name, param in model.named_parameters():
         if not param.requires_grad:

@@ -9,7 +9,6 @@ import torch
 import torch.distributed as dist
 from torch import optim
 from torch.utils.data import DataLoader
-from torch.nn.utils import clip_grad_norm_
 from model.configuration import TinyuConfig
 from dataset.lm_dataset import PretrainDataset 
 from transformers import get_cosine_schedule_with_warmup
@@ -33,7 +32,6 @@ if __name__ == "__main__":
     # 锁定全局随机种子 每张卡的种子稍有不同,防止 Dropout 等随机操作在多卡上完全一致
     set_seed(args.seed + local_rank)
 
-    
     # ================= 2. 初始化模型与数据 =================
     config = TinyuConfig(
         hidden_size=args.hidden_size, 
@@ -74,13 +72,28 @@ if __name__ == "__main__":
 
     # ================= 5. 初始化混合精度与余弦退火 =================
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-    # 初始化 GradScaler (用于缩放 fp16 梯度，防止下溢)
-    scaler = torch.amp.GradScaler("cuda")
 
+    # 智能判断并选择混合精度的 dtype
+    ptdtype = torch.float16
+    if args.dtype == "bfloat16":
+        # 检查显卡是否真的支持 BF16
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            ptdtype = torch.bfloat16
+            if is_main_process: print("硬件支持 BF16，已开启 Bfloat16 混合精度训练")
+        else:
+            if is_main_process: print("当前硬件不支持 BF16，已自动降级为 Float16")
+            ptdtype = torch.float16
+    elif args.dtype == "float32":
+        ptdtype = torch.float32
+
+    # BF16 的动态范围足够大，不需要缩放梯度；如果设为 False，scaler 所有的操作都会变成空操作（无消耗）
+    scaler = torch.amp.GradScaler("cuda", enabled=(ptdtype == torch.float16))
+
+    # 计算真实的总更新步数
+    total_update_steps = (args.epochs * len(dataloader)) // args.accumulation_steps          
+    # 拿出前 10% 的步数做预热 (Warmup)
+    warmup_steps = int(total_update_steps * 0.1)           
     # 初始化学习率调度器
-    total_update_steps = (args.epochs * len(dataloader)) // args.accumulation_steps          # 计算真实的总更新步数
-    warmup_steps = int(total_update_steps * 0.1)           # 拿出前 10% 的步数做预热 (Warmup)
-
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, 
         num_warmup_steps=warmup_steps, 
@@ -98,9 +111,11 @@ if __name__ == "__main__":
         print(f"使用设备：{device}，是否开启分布式: {is_distributed}")
         print(f"已固定全局随机种子为: {args.seed}")
         if not start_epoch and not start_step:
-            print("没有找到 checkpoint，开始从零训练...") 
+            print("未找到 checkpoint，开始从零训练...") 
         else:
             print(f"已从 checkpoint 中恢复训练，从第 {start_epoch} 个 epoch 和第 {start_step} 个 step 开始训练...")
+        print(f"{'-'*50}")
+        
 
     if is_main_process and args.use_swanlab:
         import swanlab 
@@ -147,20 +162,27 @@ if __name__ == "__main__":
 
             with sync_context():
                 # 前向传播，开启自动混合精度上下文，with 块里的代码会以 fp16 运行
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                with torch.autocast(device_type="cuda", dtype=ptdtype):
                     outputs = model(input_ids, labels=labels)
                     loss = outputs.loss + (outputs.aux_loss if outputs.aux_loss is not None else 0)
                     
                     # 因为 backward() 默认是把梯度加起来，除以步数求平均值，等效于真实的大 Batch
                     loss = loss / args.accumulation_steps
 
+            if step % args.log_interval == 0 and is_main_process:
+                print(f"反向传播前真实使用: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+
                 # 无论是否更新权重，每一步都要反向传播累积梯度
                 scaler.scale(loss).backward()
+
+            if step % args.log_interval == 0 and is_main_process:
+                print(f"反向传播后真实使用: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+                print(f"缓存池预留: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
 
             if (step + 1) % args.accumulation_steps == 0 or (step + 1) == len(dataloader):
                 # 梯度裁剪：必须在 unscale 之后进行
                 scaler.unscale_(optimizer)
-                clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 # 更新权重和 Scaler
                 scaler.step(optimizer)
                 scaler.update()
@@ -170,10 +192,6 @@ if __name__ == "__main__":
                 # 更新完权重后，立刻清空积攒的梯度，迎接下一轮累积
                 optimizer.zero_grad()
 
-            if step % args.log_interval == 0 and is_main_process:
-                print(f"真实使用: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-                print(f"缓存池预留: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-            
             # 3. 记录与上传日志
             if step % args.log_interval == 0 and is_main_process:
                 real_loss = loss.item() * args.accumulation_steps
