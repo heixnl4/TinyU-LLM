@@ -3,6 +3,8 @@ import sys
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import random         # Python 原生随机库
+import numpy as np    # NumPy 库
 import torch
 from transformers import AutoTokenizer
 from model.model_Tinyu import TinyuForcausalLM
@@ -28,3 +30,16 @@ def init_model(config, tokenizer_path='../model', device='cuda'):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     
     return model, tokenizer
+
+# 定义随机种子固定函数
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # 针对多卡环境
+    
+    # 开启 cuDNN 的确定性行为（会牺牲极其微小的一点点训练速度，但保证了100%可复现）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
