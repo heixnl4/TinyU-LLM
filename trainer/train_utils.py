@@ -24,7 +24,6 @@ def print_model_param_details(model, detail=False, prefix=""):
         total_params += param_count
         if detail:
             print(f"{prefix}{name}: {param_count / 1e6:.3f}M")
-    print(f"{'-'*50}")
     print(f"Total trainable params: {total_params / 1e6:.2f}M")
     print(f"{'-'*50}")
 
@@ -69,7 +68,7 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, step, path, is_d
 # Checkpoint 读取函数
 def load_checkpoint(model, optimizer, scheduler, scaler, path, device, is_distributed):
     if not os.path.exists(path):
-        return 0, 0, None  # 如果文件不存在，从头开始
+        return 0, 0, None
         
     print(f"--- 正在从 Checkpoint 恢复: {path} ---")
     checkpoint = torch.load(path, map_location=device)
@@ -118,7 +117,7 @@ def log_training_progress(start_epoch, start_step, step, epoch, epochs, dataload
 
     # 2. 计算耗时与 ETA
     elapsed_seconds = time.time() - start_time                     
-    steps_per_second = calc_step - (start_step + (start_epoch * dataloader_len)) / elapsed_seconds                 
+    steps_per_second = (calc_step - (start_step + (start_epoch * dataloader_len))) / elapsed_seconds                 
     remaining_steps = total_steps - global_step                    
     eta_seconds = remaining_steps / steps_per_second               
 
@@ -129,7 +128,7 @@ def log_training_progress(start_epoch, start_step, step, epoch, epochs, dataload
     # 4. 打印进度日志
     print(f"Epoch: [{epoch+1}/{epochs}] | Step: [{global_step}/{total_steps}] | "
           f"Loss: {loss_val:.4f} | Learning_rate: {lr:.6f} | "
-          f"已耗时: {elapsed_str} | 预计剩余: {eta_str}")
+          f"本次训练已耗时: {elapsed_str} | 预计剩余: {eta_str}")
     
     # 5. 上传至 SwanLab
     if use_swanlab:

@@ -4,7 +4,7 @@ import sys
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-import time           # 用于记录时间戳
+import time           
 import torch
 import torch.distributed as dist
 from torch import optim
@@ -12,14 +12,12 @@ from torch.utils.data import DataLoader
 from model.configuration import TinyuConfig
 from dataset.lm_dataset import PretrainDataset 
 from transformers import get_cosine_schedule_with_warmup
-from trainer.arguments import parse_args        # 中央参数解析器
+from trainer.arguments import parse_args
 from trainer.train_utils import print_model_param_details, init_model,  set_seed, save_checkpoint
 from trainer.train_utils import load_checkpoint, setup_device_and_distributed, log_training_progress
-# 导入分布式计算需要的模块
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from contextlib import nullcontext
-
 
 
 if __name__ == "__main__":
@@ -65,7 +63,8 @@ if __name__ == "__main__":
     if is_distributed:
         # 分布式采样器：确保不同的 GPU 拿到不同的数据切片，不会重复训练
         sampler = DistributedSampler(dataset)
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False) # 注意：用 sampler 时 shuffle 必须为 False
+        # 用 sampler 时 shuffle 必须为 False
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False) 
     else:
         sampler = None
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
@@ -101,8 +100,15 @@ if __name__ == "__main__":
     )
 
     # ================= 6. checkpoint 检查 =================
+    # 用模型的核心架构参数生成一个“架构签名”
+    arch_signature = f"h{args.hidden_size}_l{args.num_hidden_layers}_ah{args.num_attention_heads}_moe{int(args.use_moe)}"
+
+    # 按 run_name 和 架构签名 来建立独立的 Checkpoint 文件夹
+    # 比如：./checkpoints/simple-test-run-01_h256_l2_ah4_moe1
+    current_ckpt_dir = os.path.join(args.checkpoint_dir, f"{args.run_name}_{arch_signature}")
+
     # 尝试加载 Checkpoint
-    checkpoint_path = f"{args.checkpoint_dir}/pretrain_checkpoint.pth"
+    checkpoint_path = f"{current_ckpt_dir}/pretrain_checkpoint.pth"
     start_epoch, start_step, swanlab_id = load_checkpoint(
         model, optimizer, scheduler, scaler, checkpoint_path, device, is_distributed
     )

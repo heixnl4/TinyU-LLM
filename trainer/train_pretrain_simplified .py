@@ -10,7 +10,7 @@ from torch import optim
 from model.configuration import TinyuConfig
 from model.model_Tinyu import TinyuForcausalLM 
 from dataset.lm_dataset import PretrainDataset 
-from trainer.train_utils import print_model_param_details
+from transformers import AutoTokenizer
 
 # ================= 1. 基础配置 =================
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -22,21 +22,16 @@ lr = 5e-4
 config = TinyuConfig(
     hidden_size=256, 
     num_hidden_layers=2,
-    vocab_size=1000,
     num_attention_heads=4,
     num_key_value_heads=2,
     use_moe=True
-) # 先用小参数测试
+)
+
+tokenizer = AutoTokenizer.from_pretrained("../model")
 model = TinyuForcausalLM(config).to(device)
-
-# 打印模型总参数量（单位：百万，即 M）
-print_model_param_details(model, detail=True, prefix="tinyu")
-
-
-dataset = PretrainDataset("../dataset/pretrain_hq.jsonl", max_length=512)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
 optimizer = optim.AdamW(model.parameters(), lr=lr)
+dataset = PretrainDataset("../dataset/pretrain_hq.jsonl", tokenizer, max_length=512)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 # ================= 3. 极简训练循环 =================
 model.train()
@@ -51,7 +46,7 @@ for epoch in range(epochs):
         # 2. 反向传播
         loss.backward()
         
-        # 3. 梯度裁剪 (防止梯度爆炸，极其重要)
+        # 3. 梯度裁剪
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         
         # 4. 更新权重
@@ -63,5 +58,6 @@ for epoch in range(epochs):
             print(f"Epoch: {epoch}, Step: {step}, Loss: {loss.item():.4f}")
             
     # 每轮跑完存一个模型
-    torch.save(model.state_dict(), f"tinyu_epoch_{epoch}.pth")
+    os.makedirs("../out", exist_ok=True)
+    torch.save(model.state_dict(), f"../out/pretrain_s_epoch_{epoch}.pth")
     print(f"Epoch {epoch} 完成并保存！")
