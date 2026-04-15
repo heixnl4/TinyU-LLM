@@ -14,7 +14,7 @@ from torch.nn.utils import clip_grad_norm_
 from model.configuration import TinyuConfig
 from dataset.lm_dataset import PretrainDataset 
 from transformers import get_cosine_schedule_with_warmup
-from trainer.train_utils import print_model_param_details, init_model
+from trainer.train_utils import print_model_param_details, init_model, set_seed
 
 # 导入分布式计算需要的模块
 import torch.distributed as dist
@@ -40,11 +40,16 @@ else:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     local_rank = 0
 
+# 锁定全局随机种子
+base_seed = 42 
+# 每张卡的种子稍有不同,防止 Dropout 等随机操作在多卡上完全一致
+set_seed(base_seed + local_rank)
+
 # 判断当前是否为主进程 (用于打印日志和保存模型，防止多卡重复输出)
 is_main_process = (local_rank == 0)
 if is_main_process:
     print(f"使用设备：{device}，是否开启分布式: {is_distributed}")
-
+    print(f"已固定全局随机种子为: {base_seed}")
 
 epochs = 2
 batch_size = 16
@@ -62,7 +67,8 @@ if is_main_process:
             "use_compile": use_compile,
             "learning_rate": lr,
             "hidden_size": 512,
-            "num_layers": 6
+            "num_layers": 6,
+            "seed": base_seed       
         }
     )
 
