@@ -19,7 +19,7 @@ def parse_args():
     parser.add_argument("--hidden_size", type=int, default=512, help="隐藏层维度")
     parser.add_argument("--num_hidden_layers", type=int, default=4, help="隐藏层层数")
     parser.add_argument("--num_attention_heads", type=int, default=8, help="注意力头数")
-    parser.add_argument("--num_key_value_heads", type=int, default=4, help="KV 头数")
+    parser.add_argument("--num_key_value_heads", type=int, default=2, help="KV 头数")
     
     # 布尔类型的开关参数，如果在命令行加上 --use_moe 就是 True，不加就是 False
     parser.add_argument("--use_moe", action="store_true", help="是否开启 MoE 架构")
@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument("--use_swanlab", action="store_true", help="是否使用Swanlab")
 
     # ================= 3. 路径与保存配置 =================
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_part.jsonl", help="训练数据集路径")
+    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl", help="训练数据集路径")
     parser.add_argument("--checkpoint_dir", type=str, default="../checkpoints", help="模型与 Checkpoint 保存目录")
     parser.add_argument("--output_dir", type=str, default="../out", help="模型与 Checkpoint 保存目录")
     parser.add_argument("--save_steps", type=int, default=1000, help="每隔多少步保存一次 Checkpoint")
@@ -35,7 +35,27 @@ def parse_args():
     # ================= 4. 日志与实验追踪 =================
     parser.add_argument("--log_interval", type=int, default=100, help="每隔多少步打印一次日志")
     parser.add_argument("--project_name", type=str, default="TinyU-LLM-Pretrain", help="SwanLab 项目名称")
-    parser.add_argument("--run_name", type=str, default="run-default", help="本次实验名称")
+    parser.add_argument("--run_name", type=str, default="run-1", help="本次实验名称")
+
+    args = parser.parse_args()
+    return args
+
+
+def inference_args():
+    parser = argparse.ArgumentParser(description="TinyU-LLM 训练全局参数配置")
+
+    parser.add_argument("--epochs", type=int, default=2, help="训练总轮数")
+    
+    parser.add_argument("--hidden_size", type=int, default=512, help="隐藏层维度")
+    parser.add_argument("--num_hidden_layers", type=int, default=4, help="隐藏层层数")
+    parser.add_argument("--num_attention_heads", type=int, default=8, help="注意力头数")
+    parser.add_argument("--num_key_value_heads", type=int, default=2, help="KV 头数")
+    
+    parser.add_argument("--use_moe", action="store_true", help="是否开启 MoE 架构")
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="模型与 Checkpoint 保存目录")
+    parser.add_argument("--output_dir", type=str, default="./out", help="模型与 Checkpoint 保存目录")
+
+    parser.add_argument("--run_name", type=str, default="run-1", help="本次实验名称")
 
     args = parser.parse_args()
     return args

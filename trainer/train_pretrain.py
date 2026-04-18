@@ -229,8 +229,9 @@ if __name__ == "__main__":
         if is_main_process:
             # 如果被 DDP 包装过，需要用 model.module.state_dict() 取出真实权重
             state_dict = model.module.state_dict() if is_distributed else model.state_dict()
-            os.makedirs(args.output_dir, exist_ok=True)
-            torch.save(state_dict, f"{args.output_dir}/pretrain_epoch_{epoch}.pth")
+            output_dir = os.path.join(args.output_dir, f"{args.run_name}_{arch_signature}")
+            os.makedirs(output_dir, exist_ok=True)
+            torch.save(state_dict, f"{output_dir}/pretrain_epoch_{epoch}.pth")
             print(f"Epoch {epoch} 完成并保存！")
 
     if is_main_process and args.use_swanlab:
