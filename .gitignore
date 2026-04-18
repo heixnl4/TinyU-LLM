@@ -17,6 +17,7 @@ checkpoints/
 # 日志和可视化 
 swanlog/
 wandb/
+问题/
 
 # 虚拟环境 
 venv/

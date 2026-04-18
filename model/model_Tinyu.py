@@ -62,8 +62,8 @@ class Attention(nn.Module):
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
         if past_key_value is not None:
-            xk = torch.cat(past_key_value[0], xk, dim=1)
-            xv = torch.cat(past_key_value[1], xv, dim=1)
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
 
         xq = xq.transpose(1, 2)
@@ -112,66 +112,116 @@ class FeedForward(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x) * self.up_proj(x)))
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class MOEFeedForward(nn.Module):
     def __init__(self, config: TinyuConfig):
         super().__init__()
         self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_token
 
-        # 共享专家
-        if config.num_shared_experts > 0:
+        # 1. 共享专家 (Shared Experts)
+        self.num_shared_experts = config.num_shared_experts
+        if self.num_shared_experts > 0:
             self.shared_experts = nn.ModuleList([
                 FeedForward(config, intermediate_size=config.moe_intermediate_size) 
-                for _ in range(config.num_shared_experts)
+                for _ in range(self.num_shared_experts)
             ])
+        else:
+            self.shared_experts = None
 
-        # 路由专家
+        # 2. 路由专家 (Routed Experts)
         self.experts = nn.ModuleList([
             FeedForward(config, intermediate_size=config.moe_intermediate_size) 
-            for _ in range(config.num_experts)])
+            for _ in range(self.num_experts)
+        ])
 
-        # 路由器
-        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False) 
+        # 3. 路由器 (Router)
+        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
 
     def forward(self, x):
         batch_size, seq_len, hidden_size = x.shape
-        x_flat = x.view(-1, hidden_size)
+        # 将输入展平为 [num_tokens, hidden_size]，方便统一进行路由和处理
+        x_flat = x.view(-1, hidden_size) 
 
-        # 计算共享专家的输出
+        # ==========================================
+        # 步骤 1：计算共享专家输出
+        # ==========================================
         shared_output = torch.zeros_like(x_flat)
         if self.shared_experts is not None:
             for shared_expert in self.shared_experts:
                 shared_output += shared_expert(x_flat)
 
-        # 计算路由专家的输出
-        gate = F.softmax(self.gate(x_flat), dim=-1)
-        topk_weight, topk_idx = torch.topk(gate, k=self.config.num_experts_per_token, dim=-1, sorted=False)
-        topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+        # ==========================================
+        # 步骤 2：路由器计算 (Router Computation)
+        # ==========================================
+        # 计算每个 token 对各个专家的偏好分数
+        gate_logits = self.gate(x_flat) # [num_tokens, num_experts]
+        gate_probs = F.softmax(gate_logits, dim=-1)
+
+        # 选出 Top-K 个专家及其对应的概率
+        topk_weights, topk_indices = torch.topk(gate_probs, k=self.top_k, dim=-1, sorted=False) # [num_tokens, top_k]
+
+        # 将选中的 Top-K 权重进行归一化，使其和为 1
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+
+        # ==========================================
+        # 步骤 3：计算路由专家输出 (Routed Experts)
+        # ==========================================
         routed_output = torch.zeros_like(x_flat)
 
         for i, expert in enumerate(self.experts):
-            chosen_experts = (topk_idx == i)
-            if chosen_experts.any():
-                token_idx = chosen_experts.any(dim=-1).nonzero().squeeze()
-                weigth = topk_weight[chosen_experts].view(-1, 1)
-                routed_output.index_add_(dim=0, index=token_idx, source=(weigth * expert(x_flat[token_idx])).to(routed_output.dtype))
+            # 找到分配给当前专家 i 的 Token 布尔矩阵 [num_tokens, top_k]
+            expert_match = (topk_indices == i)
+            # 压缩为一维布尔掩码 [num_tokens]，表示哪些 token 至少有一次选中了该专家
+            expert_mask = expert_match.any(dim=-1)
+
+            if expert_mask.any():
+                # 提取被选中的 token 索引。注意使用 squeeze(-1) 防止单一 token 时变成 0 维张量崩溃
+                token_indices = expert_mask.nonzero().squeeze(-1)
+
+                # 提取对应的特征输入
+                expert_inputs = x_flat[token_indices]
+
+                # 巧妙利用布尔索引提取对应的权重，并塑形为 [选中数量, 1] 用于广播乘法
+                # 只有 topk_indices 中等于 i 的位置对应的 topk_weights 才会被提取出来
+                weights_for_expert = topk_weights[expert_match].view(-1, 1)
+
+                # 专家进行计算并乘上归一化后的权重
+                expert_outputs = expert(expert_inputs) * weights_for_expert
+                
+                # 将计算结果加回原张量对应的位置
+                routed_output.index_add_(dim=0, index=token_indices, source=expert_outputs.to(routed_output.dtype))
             elif self.training:
-            # 只在训练时特殊处理没使用的experts 
-                routed_output[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+                # 训练时，如果某个专家没被分配到任何 token，添加一个值为 0 的梯度反传
+                # 这是为了防止在分布式训练 (DDP) 时因为参数未参与计算而报错
+                dummy_loss = sum(p.sum() for p in expert.parameters()) * 0.0
+                routed_output[0, 0] += dummy_loss.to(routed_output.dtype)
+        
+        # ==========================================
+        # 步骤 4：计算负载均衡辅助损失 (Auxiliary Loss)
+        # ==========================================
         
         # 负载均衡辅助损失
         if self.training and self.config.router_aux_loss_coef > 0:
-            load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)     # (K, E)
-            self.aux_loss = (load * gate.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef    # gate.mean(0)  [E,]
-        else:
-            self.aux_loss = gate.new_zeros(1).squeeze()
+            # topk_indices: [num_tokens, top_k] -> one_hot: [num_tokens, top_k, num_experts]
+            # sum(dim=1): 将 top_k 的维度累加，得到每个 token 对专家的实际分配情况 -> [num_tokens, num_experts]
+            # mean(dim=0): 计算在当前批次所有 token 中，每个专家的平均负载率 -> [num_experts]
+            load = F.one_hot(topk_indices, self.num_experts).float().sum(dim=1).mean(dim=0)
 
-        # 最终输出合并
+            # gate_probs.mean(0) 表示模型输出的平均分配倾向 -> [num_experts]
+            self.aux_loss = (load * gate_probs.mean(0)).sum() * self.num_experts * self.config.router_aux_loss_coef
+        else:
+            self.aux_loss = gate_logits.new_zeros(1).squeeze()
+
+        # ==========================================
+        # 步骤 5：组合结果并还原形状
+        # ==========================================
         final_output = shared_output + routed_output
         return final_output.view(batch_size, seq_len, hidden_size)
-
 
 class TinyuBlock(nn.Module):
     def __init__(self, layer_id: int, config: TinyuConfig):
@@ -194,8 +244,9 @@ class TinyuBlock(nn.Module):
             attention_mask)
         hidden_states += residual
 
+        residual = hidden_states # 保存未归一化的残差
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = hidden_states + self.mlp(hidden_states)
+        hidden_states = residual + self.mlp(hidden_states) # 加到残差上
 
         return hidden_states, present_key_value
     
@@ -259,7 +310,7 @@ class TinyuForcausalLM(PreTrainedModel, GenerationMixin):
 
 
     def forward(self, input_ids, past_key_values=None, use_cache=False, attention_mask=None, logits_to_keep=0, labels=None):
-        hidden_states, presents, aux_loss = self.model(input_ids, past_key_values, use_cache, attention_mask)
+        hidden_states, past_key_values, aux_loss = self.model(input_ids, past_key_values, use_cache, attention_mask)
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])

@@ -51,15 +51,41 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=100, temperature=0.8,
     print("[Model]: ", end="", flush=True)
     
     generated_ids = input_ids[0].tolist()
+
+    # 🌟 新增：初始化 KV Cache 变量
+    past_key_values = None
+
+    # 🌟 第一阶段：Prefill (预填充阶段)
+    # 把用户输入的整段 Prompt 一次性送入模型，建立初始的 KV Cache
+    # 注意：此时模型的 forward 需要支持 use_cache=True 并返回 past_key_values
+    outputs = model(input_ids, use_cache=True)
+    next_token_logits = outputs.logits[0, -1, :]
+    past_key_values = outputs.past_key_values  # 拿到第一批缓存
+
+    # 采样算出第一个新词
+    if temperature != 1.0:
+        next_token_logits = next_token_logits / temperature
+    filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
+    probs = F.softmax(filtered_logits, dim=-1)
+    next_token = torch.multinomial(probs, num_samples=1).item()
+    
+    generated_ids.append(next_token)
+    print(tokenizer.decode([next_token], skip_special_tokens=True), end="", flush=True)
+
+    if next_token == tokenizer.eos_token_id:
+        print("\n" + "-"*50)
+        return tokenizer.decode(generated_ids, skip_special_tokens=True)
     
     # 2. 核心自回归循环
-    for _ in range(max_new_tokens):
-        # 准备模型输入：在实际工程中，这里会配合 KV Cache 来极大降低计算量
-        inputs = torch.tensor([generated_ids]).to(device)
+    for _ in range(max_new_tokens - 1):
+        # 🌟 核心性能起飞点：当前的 input 永远只有 1 个 token (即上一步刚生成的词)！
+        # 不再是把整个 generated_ids 塞进去了！
+        current_input = torch.tensor([[next_token]]).to(device)
         
-        # 前向传播，获取最后一位 token 的预测分数
-        outputs = model(inputs)
+        # 🌟 前向传播：传入 current_input 并且传入 past_key_values
+        outputs = model(current_input, past_key_values=past_key_values, use_cache=True)
         next_token_logits = outputs.logits[0, -1, :] 
+        past_key_values = outputs.past_key_values
         
         # 应用 Temperature 缩放
         # 公式: q_i = exp(z_i / T) / sum(exp(z_j / T))
