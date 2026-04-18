@@ -18,8 +18,10 @@ checkpoints/
 swanlog/
 wandb/
 问题/
+笔记/
 
 # 虚拟环境 
 venv/
 env/
 .env
+

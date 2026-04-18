@@ -48,10 +48,16 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 # Checkpoint 保存函数
-def save_checkpoint(model, optimizer, scheduler, scaler, epoch, step, path, is_distributed, swanlab_id):
+def save_checkpoint(model, optimizer, scheduler, scaler, epoch, step, path, is_distributed, swanlab_id, only_lora=False):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # 如果是分布式训练，需要取 model.module
     model_state = model.module.state_dict() if is_distributed else model.state_dict()
+
+    # 仅保存 LoRA 参数
+    if only_lora:
+        lora_state = {k: v for k, v in model_state.items() if 'lora_A' in k or 'lora_B' in k}
+        model_state = lora_state
+        print(f"已过滤出 {len(model_state)} 个 LoRA 参数进行保存。")
     
     checkpoint = {
         'epoch': epoch,
@@ -66,18 +72,19 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, step, path, is_d
     print(f"--- Checkpoint 已保存至: {path} ---")
 
 # Checkpoint 读取函数
-def load_checkpoint(model, optimizer, scheduler, scaler, path, device, is_distributed):
+def load_checkpoint(model, optimizer, scheduler, scaler, path, device, is_distributed, strict=True):
     if not os.path.exists(path):
         return 0, 0, None
         
     print(f"--- 正在从 Checkpoint 恢复: {path} ---")
     checkpoint = torch.load(path, map_location=device)
     
-    # 加载权重
+    # 核心加载逻辑：如果是 SFT 恢复，strict 必须传 False
+    # strict=False 只加载字典里有的，没找到的保持刚加载的预训练基座权重”。
     if is_distributed:
-        model.module.load_state_dict(checkpoint['model_state_dict'])
+        model.module.load_state_dict(checkpoint['model_state_dict'], strict=strict)
     else:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
         
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
