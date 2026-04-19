@@ -1,12 +1,12 @@
 # trainer/arguments.py
 import argparse
 
-def pretrain_args():
+def parse_pretrain_args():
     parser = argparse.ArgumentParser(description="TinyU-LLM 训练全局参数配置")
 
     # ================= 1. 基础训练参数 =================
     parser.add_argument("--epochs", type=int, default=2, help="训练总轮数")
-    parser.add_argument("--batch_size", type=int, default=16, help="单卡 Batch Size")
+    parser.add_argument("--batch_size", type=int, default=32, help="单卡 Batch Size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="最大学习率")
     parser.add_argument("--seed", type=int, default=42, help="全局随机种子")
     parser.add_argument("--max_length", type=int, default=512, help="模型最大上下文长度")
@@ -35,7 +35,7 @@ def pretrain_args():
     # ================= 4. 日志与实验追踪 =================
     parser.add_argument("--log_interval", type=int, default=100, help="每隔多少步打印一次日志")
     parser.add_argument("--project_name", type=str, default="TinyU-LLM-Pretrain", help="SwanLab 项目名称")
-    parser.add_argument("--run_name", type=str, default="run-1", help="本次实验名称")
+    parser.add_argument("--run_name", type=str, default="run-2", help="本次实验名称")
 
     args = parser.parse_args()
     return args

@@ -5,6 +5,7 @@ __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import time
+import datetime
 import torch
 import torch.distributed as dist
 from torch import optim
@@ -168,6 +169,11 @@ if __name__ == "__main__":
     # ================= 5. SFT 训练循环 =================
     model.train()
     optimizer.zero_grad()
+    running_loss = 0.0
+    running_aux_loss = 0.0
+    global_update_step = 0
+    if start_epoch > 0 or start_step > 0:
+        global_update_step = (start_epoch * len(dataloader) + start_step) // args.accumulation_steps
     start_time = time.time()
 
     for epoch in range(start_epoch, args.epochs):
@@ -180,13 +186,26 @@ if __name__ == "__main__":
             # 判断当前 step 是否是累积的最后一步
             is_update_step = (step + 1) % args.accumulation_steps == 0 or (step + 1) == len(dataloader)
             
-            sync_context = model.no_sync if is_distributed and (step + 1) % args.accumulation_steps != 0 else nullcontext
+            sync_context = model.no_sync if is_distributed and not is_update_step else nullcontext
             with sync_context():
                 with torch.autocast(device_type="cuda", dtype=torch.float16): # 或 ptdtype
                     # 这里的 labels 已经被 SFTDataset 处理过了 (Prompt 部分是 -100)
                     outputs = model(input_ids, labels=labels)
-                    loss = outputs.loss + outputs.aux_loss
-                    loss = loss / args.accumulation_steps
+
+                    raw_main_loss = outputs.loss
+                    raw_aux_loss = outputs.aux_loss
+                    running_loss += raw_main_loss
+                    running_aux_loss += raw_aux_loss
+                    loss = raw_main_loss + raw_aux_loss
+
+                    if (step + 1) == len(dataloader):
+                        current_accum_steps = len(dataloader) % args.accumulation_steps
+                        if current_accum_steps == 0:
+                            current_accum_steps = args.accumulation_steps
+                    else:
+                        current_accum_steps = args.accumulation_steps
+
+                    loss = loss / current_accum_steps
 
                 if step % args.log_interval == 0 and is_main_process:
                     print(f"反向传播前真实使用: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
@@ -201,37 +220,46 @@ if __name__ == "__main__":
             if is_update_step:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                scale_after = scaler.get_scale()
+                if scale_before <= scale_after:
+                    scheduler.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                global_update_step += 1
 
-            if step % args.log_interval == 0 and is_main_process:
-                real_loss = loss.item() * args.accumulation_steps
-                real_aux_loss = outputs.aux_loss.item() if outputs.aux_loss is not None else 0
+                if global_update_step % args.log_interval == 0 and is_main_process:
+                    avg_loss = (running_loss / current_accum_steps).item()
+                    avg_aux_loss = (running_aux_loss / current_accum_steps).item()
 
-                log_training_progress(
-                    start_epoch, 
-                    start_step,
-                    step=step,
-                    epoch=epoch,
-                    epochs=args.epochs,
-                    dataloader_len=len(dataloader),
-                    total_steps=args.epochs * len(dataloader),
-                    loss_val=real_loss,
-                    aux_loss_val=real_aux_loss,
-                    lr=optimizer.param_groups[0]['lr'],
-                    start_time=start_time,
-                    use_swanlab=args.use_swanlab,
-                )
-                
-            # 保存一次 Checkpoint 
-            if step > 0 and step % args.save_steps == 0 and is_main_process:
-                save_checkpoint(
-                    model, optimizer, scheduler, scaler, epoch, step, 
-                    checkpoint_path, is_distributed, swanlab_id,
-                    only_lora=True  # 必须开启过滤
-                )
+                    log_training_progress(
+                        start_epoch, 
+                        start_step,
+                        step=step,
+                        epoch=epoch,
+                        epochs=args.epochs,
+                        dataloader_len=len(dataloader),
+                        total_steps=args.epochs * len(dataloader),
+                        loss_val=avg_loss,
+                        aux_loss_val=avg_aux_loss,
+                        lr=optimizer.param_groups[0]['lr'],
+                        start_time=start_time,
+                        use_swanlab=args.use_swanlab,
+                    )
+                    
+                # 打印完并且更新完权重后，清空累积容器
+                running_loss = 0.0
+                running_aux_loss = 0.0
+
+                # 保存一次 Checkpoint 
+                if global_update_step > 0 and global_update_step % args.save_steps == 0 and is_main_process:
+                    save_checkpoint(
+                        model, optimizer, scheduler, scaler, epoch, step, 
+                        checkpoint_path, is_distributed, swanlab_id,
+                        only_lora=True  # 必须开启过滤
+                    )
 
         # ================= 6. 保存 LoRA 权重 =================
         if is_main_process:
@@ -245,6 +273,10 @@ if __name__ == "__main__":
             else:
                 torch.save(state_dict, f"{output_dir}/lora_epoch_{epoch}.pth")
             print(f"Epoch {epoch} 完成，LoRA 权重已保存至 {output_dir}")
+    
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print(f"训练完成！总耗时: {total_time_str}")
                         
     if is_main_process and args.use_swanlab:
         swanlab.finish()

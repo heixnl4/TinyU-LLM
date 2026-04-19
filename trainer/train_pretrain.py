@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from model.configuration import TinyuConfig
 from dataset.lm_dataset import PretrainDataset 
 from transformers import get_cosine_schedule_with_warmup
-from trainer.arguments import pretrain_args
+from trainer.arguments import parse_pretrain_args
 from trainer.train_utils import print_model_param_details, init_model,  set_seed, save_checkpoint
 from trainer.train_utils import load_checkpoint, setup_device_and_distributed, log_training_progress
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -24,7 +24,7 @@ from contextlib import nullcontext
 
 if __name__ == "__main__":
     # ================= 0. 获取全局配置 =================
-    args = pretrain_args()
+    args = parse_pretrain_args()
     # 用模型的核心架构参数生成一个“架构签名”
     arch_signature = f"h{args.hidden_size}_l{args.num_hidden_layers}_ah{args.num_attention_heads}_moe{int(args.use_moe)}"
 
@@ -148,13 +148,16 @@ if __name__ == "__main__":
     model.train()
     # 清空梯度的操作必须移到循环外面（或者更新权重的后面）
     optimizer.zero_grad()
-    # 记录整个训练开始的时间
-    start_time = time.time()
+    # 初始化用于累积真实 Loss 的变量
+    running_loss = 0.0
+    running_aux_loss = 0.0
     # 记录全局更新步数
     global_update_step = 0
     if start_epoch > 0 or start_step > 0:
         # 根据已练过的数据量推算真实的全局更新步数
         global_update_step = (start_epoch * len(dataloader) + start_step) // args.accumulation_steps
+    # 记录整个训练开始的时间
+    start_time = time.time()
 
     # 如果是恢复训练则从 start_epoch 开始，如果没有 checkpoint 则 start_epoch 默认为0
     for epoch in range(start_epoch, args.epochs):
@@ -195,9 +198,13 @@ if __name__ == "__main__":
                         current_accum_steps = args.accumulation_steps
                     
                     # loss 真实数值累加起来
-                    running_loss += raw_main_loss.item()
+                    # 2. 在 with sync_context() 内部修改累加逻辑：
+                    # 核心：使用 .detach().float() 代替 .item()
+                    # .detach() 将 tensor 从计算图中剥离，防止显存泄漏（OOM）
+                    # .float() 转换精度，防止 fp16 累加溢出
+                    running_loss += raw_main_loss.detach().float()
                     if outputs.aux_loss is not None:
-                        running_aux_loss += raw_aux_loss.item()
+                        running_aux_loss += raw_aux_loss.detach().float()
 
                     # 因为 backward() 默认是把梯度加起来，除以步数求平均值，等效于真实的大 Batch
                     loss = loss / current_accum_steps
@@ -231,34 +238,38 @@ if __name__ == "__main__":
                 # 更新完权重后，立刻清空积攒的梯度，迎接下一轮累积
                 optimizer.zero_grad()
 
-            # 3. 记录与上传日志
-            if step % args.log_interval == 0 and is_main_process:
-                # 计算这一个大 Batch（Macro-batch）的真实平均 Loss
-                avg_loss = running_loss / current_accum_steps
-                avg_aux_loss = running_aux_loss / current_accum_steps
+                # 基于全局更新步数来保存和上传日志
+                global_update_step += 1
 
-                log_training_progress(
-                    start_epoch, 
-                    start_step,
-                    step=step,
-                    epoch=epoch,
-                    epochs=args.epochs,
-                    dataloader_len=len(dataloader),
-                    total_steps=args.epochs * len(dataloader),
-                    loss_val=avg_loss,
-                    aux_loss_val=avg_aux_loss,
-                    lr=optimizer.param_groups[0]['lr'],
-                    start_time=start_time,
-                    use_swanlab=args.use_swanlab,
-                )
+                # 3. 记录与上传日志
+                if global_update_step % args.log_interval == 0 and is_main_process:
+                    # 计算这一个大 Batch（Macro-batch）的真实平均 Loss
+                    avg_loss = (running_loss / current_accum_steps).item()
+                    # aux_loss 可能是浮点数 0，也可能是 Tensor
+                    if isinstance(running_aux_loss, torch.Tensor):
+                        avg_aux_loss = (running_aux_loss / current_accum_steps).item()
+                    else:
+                        avg_aux_loss = 0.0
+
+                    log_training_progress(
+                        start_epoch, 
+                        start_step,
+                        step=step,
+                        epoch=epoch,
+                        epochs=args.epochs,
+                        dataloader_len=len(dataloader),
+                        total_steps=args.epochs * len(dataloader),
+                        loss_val=avg_loss,
+                        aux_loss_val=avg_aux_loss,
+                        lr=optimizer.param_groups[0]['lr'],
+                        start_time=start_time,
+                        use_swanlab=args.use_swanlab,
+                    )
                 # 打印完并且更新完权重后，清空累积容器
                 running_loss = 0.0
                 running_aux_loss = 0.0
                 
-            # 保存一次 Checkpoint 
-            if is_update_step:
-                # 基于全局更新步数来保存
-                global_update_step += 1
+                # 保存一次 Checkpoint 
                 if global_update_step > 0 and global_update_step % args.save_steps == 0 and is_main_process:
                     save_checkpoint(
                         model, optimizer, scheduler, scaler, epoch, step, 

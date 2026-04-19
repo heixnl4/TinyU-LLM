@@ -131,7 +131,7 @@ def main():
     arch_signature = f"h{args.hidden_size}_l{args.num_hidden_layers}_ah{args.num_attention_heads}_moe{int(args.use_moe)}"
     output_dir = os.path.join(args.output_dir, f"{args.run_name}_{arch_signature}")
     os.makedirs(output_dir, exist_ok=True)
-    checkpoint_path = f"{output_dir}/pretrain_epoch_{args.epochs - 1}.pth" 
+    checkpoint_path = f"{output_dir}/pretrain_checkpoint.pth" 
     tokenizer_path = "./model" 
     
     # 2. 初始化模型架构 (需要和预训练时保持绝对一致)
