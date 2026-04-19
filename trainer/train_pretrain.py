@@ -15,7 +15,7 @@ from model.configuration import TinyuConfig
 from dataset.lm_dataset import PretrainDataset 
 from transformers import get_cosine_schedule_with_warmup
 from trainer.arguments import parse_pretrain_args
-from trainer.train_utils import print_model_param_details, init_model,  set_seed, save_checkpoint
+from trainer.train_utils import SkipStepSampler, print_model_param_details, init_model, set_seed, save_checkpoint
 from trainer.train_utils import load_checkpoint, setup_device_and_distributed, log_training_progress
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -66,12 +66,32 @@ if __name__ == "__main__":
 
     if is_distributed:
         # 分布式采样器：确保不同的 GPU 拿到不同的数据切片，不会重复训练
-        sampler = DistributedSampler(dataset)
+        base_sampler = DistributedSampler(dataset)
         # 用 sampler 时 shuffle 必须为 False
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False) 
     else:
-        sampler = None
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+        from torch.utils.data import RandomSampler, SequentialSampler
+        base_sampler = RandomSampler(dataset)
+
+    # 2. 判断是否需要跳过数据 (仅在恢复训练的那个 Epoch 生效)
+    # 注意：start_step 是上一次断点前最后完成的 step 索引
+    if start_epoch > 0 or start_step > 0:
+        # 比如断点保存在 step 3 (第4个batch)，那么我们要跳过前 4 个 step
+        steps_to_skip = start_step + 1 
+        print(f"正在从 Sampler 层面直接跳过前 {steps_to_skip} 个 Step 的数据...")
+        sampler = SkipStepSampler(base_sampler, steps_to_skip, args.batch_size)
+    else:
+        sampler = base_sampler
+
+    # 3. 初始化 DataLoader
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        sampler=sampler, 
+        shuffle=False,      # 使用了 Sampler，这里必须是 False
+        num_workers=4,      # 记得加上多进程
+        pin_memory=True,    # 记得开启锁页内存
+        drop_last=True
+    )
 
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     # ================= 5. 初始化混合精度与余弦退火 =================
@@ -155,7 +175,7 @@ if __name__ == "__main__":
     global_update_step = 0
     if start_epoch > 0 or start_step > 0:
         # 根据已练过的数据量推算真实的全局更新步数
-        global_update_step = (start_epoch * len(dataloader) + start_step) // args.accumulation_steps
+        global_update_step = (start_epoch * len(dataloader) + start_step + 1) // args.accumulation_steps
     # 记录整个训练开始的时间
     start_time = time.time()
 
@@ -166,14 +186,17 @@ if __name__ == "__main__":
             sampler.set_epoch(epoch)
 
         for step, (input_ids, labels) in enumerate(dataloader):
-            # 如果是恢复训练，跳过已经练过的 step
-            if epoch == start_epoch and step <= start_step:
-                continue
+            # 因为我们用了 SkipSampler，此时 enumerate 的 step 是从 0 重新开始计数的。
+            # 为了让日志和保存逻辑依然对齐真实的全局进度，我们需要把真实的 step 算出来：
+            if epoch == start_epoch and (start_epoch > 0 or start_step > 0):
+                real_step = step + start_step + 1
+            else:
+                real_step = step
 
-            input_ids, labels = input_ids.to(device), labels.to(device)
-
+            input_ids = input_ids.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             # 判断当前 step 是否是累积的最后一步
-            is_update_step = (step + 1) % args.accumulation_steps == 0 or (step + 1) == len(dataloader)
+            is_update_step = (real_step + 1) % args.accumulation_steps == 0 or (real_step + 1) == len(dataloader)
             
             # DDP 高级优化 防止无意义的梯度同步
             sync_context = model.no_sync if is_distributed and not is_update_step else nullcontext
@@ -189,7 +212,7 @@ if __name__ == "__main__":
                     loss = raw_main_loss + raw_aux_loss
 
                     # 动态计算当前的真实累积步数
-                    if (step + 1) == len(dataloader):
+                    if (real_step + 1) == len(dataloader):
                         # 算一下最后这一波攒了多少个 step
                         current_accum_steps = len(dataloader) % args.accumulation_steps
                         if current_accum_steps == 0:
@@ -209,13 +232,13 @@ if __name__ == "__main__":
                     # 因为 backward() 默认是把梯度加起来，除以步数求平均值，等效于真实的大 Batch
                     loss = loss / current_accum_steps
 
-                if step % args.log_interval == 0 and is_main_process:
+                if real_step % args.log_interval == 0 and is_main_process:
                     print(f"反向传播前真实使用: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
 
                 # 无论是否更新权重，每一步都要反向传播累积梯度
                 scaler.scale(loss).backward()
 
-                if step % args.log_interval == 0 and is_main_process:
+                if real_step % args.log_interval == 0 and is_main_process:
                     print(f"反向传播后真实使用: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
                     print(f"缓存池预留: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
 
@@ -254,7 +277,7 @@ if __name__ == "__main__":
                     log_training_progress(
                         start_epoch, 
                         start_step,
-                        step=step,
+                        step=real_step,
                         epoch=epoch,
                         epochs=args.epochs,
                         dataloader_len=len(dataloader),
@@ -272,7 +295,7 @@ if __name__ == "__main__":
                 # 保存一次 Checkpoint 
                 if global_update_step > 0 and global_update_step % args.save_steps == 0 and is_main_process:
                     save_checkpoint(
-                        model, optimizer, scheduler, scaler, epoch, step, 
+                        model, optimizer, scheduler, scaler, epoch, real_step, 
                         checkpoint_path, is_distributed, swanlab_id
                     )
 
