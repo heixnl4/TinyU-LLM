@@ -87,7 +87,7 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, step, path, is_d
 # Checkpoint 读取函数
 def load_checkpoint(model, optimizer, scheduler, scaler, path, device, is_distributed, strict=True, **kwargs):
     if not os.path.exists(path):
-        return 0, 0, None
+        return -1, -1, None
         
     print(f"--- 正在从 Checkpoint 恢复: {path} ---")
     checkpoint = torch.load(path, map_location=device)
@@ -152,7 +152,7 @@ def setup_device_and_distributed():
 def log_training_progress(start_epoch, start_step, step, epoch, epochs, dataloader_len, total_steps, 
                           loss_val, aux_loss_val, lr, start_time, use_swanlab):
     # 1. 计算当前全局进度
-    global_step = step + (epoch * dataloader_len) + 1
+    global_step = step + 1 + (epoch * dataloader_len)
     calc_step = global_step if global_step > 0 else 1
 
     # 2. 计算耗时与 ETA

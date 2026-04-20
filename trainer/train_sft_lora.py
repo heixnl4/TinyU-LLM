@@ -6,6 +6,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import time
 import datetime
+import math
 import torch
 import torch.distributed as dist
 from torch import optim
@@ -15,7 +16,7 @@ from model.configuration import TinyuConfig
 from dataset.lm_dataset import SFTDataset 
 from transformers import get_cosine_schedule_with_warmup
 from trainer.arguments import parse_sft_args
-from trainer.train_utils import init_model, set_seed, save_checkpoint, load_checkpoint
+from trainer.train_utils import init_model, set_seed, save_checkpoint, load_checkpoint, SkipStepSampler
 from trainer.train_utils import setup_device_and_distributed, log_training_progress
 from trainer.lora_utils import inject_custom_lora, print_trainable_parameters
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -102,11 +103,16 @@ if __name__ == "__main__":
     dataset = SFTDataset(args.data_path, tokenizer, args.max_length)
 
     if is_distributed:
-        sampler = DistributedSampler(dataset)
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False)
+        base_sampler = DistributedSampler(dataset)
     else:
-        sampler = None
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+        from torch.utils.data import RandomSampler
+        base_sampler = RandomSampler(dataset)
+
+    # 创建基础 DataLoader 用于计算总步数
+    base_dataloader = DataLoader(
+        dataset, batch_size=args.batch_size, sampler=base_sampler, drop_last=True
+    )
+    full_dataloader_len = len(base_dataloader)
 
     # 关键：优化器只接收需要计算梯度的参数 (即 LoRA 的参数)
     trainable_params = filter(lambda p: p.requires_grad, model.parameters())
@@ -125,7 +131,9 @@ if __name__ == "__main__":
         ptdtype = torch.float32
 
     scaler = torch.amp.GradScaler("cuda", enabled=(ptdtype == torch.float16))
-    total_update_steps = (args.epochs * len(dataloader)) // args.accumulation_steps          
+
+    # 修复计算方式，使用 math.ceil 确保总步数计算绝对准确
+    total_update_steps = args.epochs * math.ceil(full_dataloader_len / args.accumulation_steps)          
     warmup_steps = int(total_update_steps * 0.1)           
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, 
@@ -136,17 +144,24 @@ if __name__ == "__main__":
     # ================= 6. checkpoint 检查 =================
     current_ckpt_dir = os.path.join(args.checkpoint_dir, f"{args.run_name}_{arch_signature}")
     checkpoint_path = f"{current_ckpt_dir}/sft_checkpoint.pth"
-    start_epoch, start_step, swanlab_id = load_checkpoint(
+    load_epoch, load_step, swanlab_id = load_checkpoint(
         model, optimizer, scheduler, scaler, checkpoint_path, device, is_distributed, strict=False
     )
+
+    if load_epoch != -1:
+        is_loaded = True
+        start_epoch, start_step = load_epoch, load_step
+    else:
+        is_loaded = False
+        start_epoch = start_step = 0
 
     if is_main_process:
         print(f"使用设备：{device}，是否开启分布式: {is_distributed}")
         print(f"已固定全局随机种子为: {args.seed}")
-        if not start_epoch and not start_step:
-            print("未找到 checkpoint，开始从零训练...") 
+        if is_loaded:
+            print(f"已从 checkpoint 中恢复训练，从第 {start_epoch + 1} 个 epoch 和第 {start_step + 1} 个 step 开始训练...")
         else:
-            print(f"已从 checkpoint 中恢复训练，从第 {start_epoch} 个 epoch 和第 {start_step} 个 step 开始训练...")
+            print("未找到 checkpoint，开始从零训练...") 
         print(f"{'-'*50}")
 
     if is_main_process and args.use_swanlab:
@@ -172,19 +187,50 @@ if __name__ == "__main__":
     running_loss = 0.0
     running_aux_loss = 0.0
     global_update_step = 0
-    if start_epoch > 0 or start_step > 0:
-        global_update_step = (start_epoch * len(dataloader) + start_step + 1) // args.accumulation_steps
+
+    if is_loaded:
+        epoch_update_steps = math.ceil((load_epoch * full_dataloader_len) / args.accumulation_steps) 
+        global_update_step = epoch_update_steps + math.ceil((load_step + 1) / args.accumulation_steps)
+    
+    print(f"已更新参数次数{global_update_step}")
+
     start_time = time.time()
 
     for epoch in range(start_epoch, args.epochs):
-        if sampler is not None: sampler.set_epoch(epoch)
+        # 引入 SkipStepSampler 进行精确断点跳步
+        if epoch == start_epoch and is_loaded:
+            steps_to_skip = start_step + 1 
+            if is_main_process:
+                print(f"正在从 Sampler 层面直接跳过前 {steps_to_skip} 个 Step 的数据...")
+            sampler = SkipStepSampler(base_sampler, steps_to_skip, args.batch_size)
+        else:
+            if is_main_process:
+                print(f"Epoch {epoch}: 使用完整数据集训练...")
+            sampler = base_sampler
+
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=args.batch_size, 
+            sampler=sampler, 
+            shuffle=False,      
+            num_workers=0,      
+            pin_memory=True,    
+            drop_last=True
+        )
+
+        if hasattr(sampler, 'set_epoch'):
+            sampler.set_epoch(epoch)
 
         for step, (input_ids, labels) in enumerate(dataloader):
-            if epoch == start_epoch and step <= start_step:
-                continue
-            input_ids, labels = input_ids.to(device), labels.to(device)
+            if epoch == start_epoch and is_loaded:
+                real_step = step + start_step + 1
+            else:
+                real_step = step
+            
+            input_ids = input_ids.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             # 判断当前 step 是否是累积的最后一步
-            is_update_step = (step + 1) % args.accumulation_steps == 0 or (step + 1) == len(dataloader)
+            is_update_step = (real_step + 1) % args.accumulation_steps == 0 or (real_step + 1) == full_dataloader_len
             
             sync_context = model.no_sync if is_distributed and not is_update_step else nullcontext
             with sync_context():
@@ -194,16 +240,18 @@ if __name__ == "__main__":
 
                     raw_main_loss = outputs.loss
                     raw_aux_loss = outputs.aux_loss
-                    running_loss += raw_main_loss
-                    running_aux_loss += raw_aux_loss
                     loss = raw_main_loss + raw_aux_loss
 
-                    if (step + 1) == len(dataloader):
-                        current_accum_steps = len(dataloader) % args.accumulation_steps
+                    if (real_step + 1) == full_dataloader_len:
+                        current_accum_steps = full_dataloader_len % args.accumulation_steps
                         if current_accum_steps == 0:
                             current_accum_steps = args.accumulation_steps
                     else:
                         current_accum_steps = args.accumulation_steps
+
+                    # 核心防 OOM 逻辑：使用 detach().float()
+                    running_loss += raw_main_loss.detach().float()
+                    running_aux_loss += raw_aux_loss.detach().float()
 
                     loss = loss / current_accum_steps
 
@@ -226,8 +274,8 @@ if __name__ == "__main__":
                 scale_after = scaler.get_scale()
                 if scale_before <= scale_after:
                     scheduler.step()
-                scheduler.step()
                 optimizer.zero_grad()
+
                 global_update_step += 1
 
                 if global_update_step % args.log_interval == 0 and is_main_process:
@@ -237,11 +285,11 @@ if __name__ == "__main__":
                     log_training_progress(
                         start_epoch, 
                         start_step,
-                        step=step,
+                        step=real_step,
                         epoch=epoch,
                         epochs=args.epochs,
-                        dataloader_len=len(dataloader),
-                        total_steps=args.epochs * len(dataloader),
+                        dataloader_len=full_dataloader_len,
+                        total_steps=args.epochs * full_dataloader_len,
                         loss_val=avg_loss,
                         aux_loss_val=avg_aux_loss,
                         lr=optimizer.param_groups[0]['lr'],
@@ -256,7 +304,7 @@ if __name__ == "__main__":
                 # 保存一次 Checkpoint 
                 if global_update_step > 0 and global_update_step % args.save_steps == 0 and is_main_process:
                     save_checkpoint(
-                        model, optimizer, scheduler, scaler, epoch, step, 
+                        model, optimizer, scheduler, scaler, epoch, real_step, 
                         checkpoint_path, is_distributed, swanlab_id,
                         only_lora=True  # 必须开启过滤
                     )
@@ -269,9 +317,9 @@ if __name__ == "__main__":
             # SFT 保存模型时，只保存 LoRA 的权重 
             lora_state = {k: v for k, v in state_dict.items() if 'lora_A' in k or 'lora_B' in k}
             if epoch == (args.epochs - 1):
-                torch.save(state_dict, f"{output_dir}/lora_weight.pth")
+                torch.save(lora_state, f"{output_dir}/lora_weight.pth")
             else:
-                torch.save(state_dict, f"{output_dir}/lora_epoch_{epoch}.pth")
+                torch.save(lora_state, f"{output_dir}/lora_epoch_{epoch}.pth")
             print(f"Epoch {epoch} 完成，LoRA 权重已保存至 {output_dir}")
     
     total_time = time.time() - start_time

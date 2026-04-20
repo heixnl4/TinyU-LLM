@@ -116,14 +116,21 @@ if __name__ == "__main__":
 
     # 尝试加载 Checkpoint
     checkpoint_path = f"{current_ckpt_dir}/pretrain_checkpoint.pth"
-    start_epoch, start_step, swanlab_id = load_checkpoint(
+    load_epoch, load_step, swanlab_id = load_checkpoint(
         model, optimizer, scheduler, scaler, checkpoint_path, device, is_distributed
     )
+
+    if load_epoch != -1:
+        is_loaded = True
+        start_epoch, start_step = load_epoch, load_step
+    else:
+        is_loaded = False
+        start_epoch = start_step = 0
 
     if is_main_process:
         print(f"使用设备：{device}，是否开启分布式: {is_distributed}")
         print(f"已固定全局随机种子为: {args.seed}")
-        if not start_epoch and not start_step:
+        if is_loaded:
             print("未找到 checkpoint，开始从零训练...") 
         else:
             print(f"已从 checkpoint 中恢复训练，从第 {start_epoch + 1} 个 epoch 和第 {start_step + 1} 个 step 开始训练...")
@@ -158,9 +165,10 @@ if __name__ == "__main__":
     running_aux_loss = 0.0
     # 记录全局更新步数
     global_update_step = 0
-    if start_epoch > 0 or start_step > 0:
+    if is_loaded:
         # 根据已练过的数据量推算真实的全局更新步数
-        global_update_step = (start_epoch * full_dataloader_len + start_step + 1) // args.accumulation_steps
+        epoch_update_steps = math.ceil((load_epoch * full_dataloader_len) / args.accumulation_steps) 
+        global_update_step = epoch_update_steps + math.ceil((load_step + 1) / args.accumulation_steps)
     # 记录整个训练开始的时间
     start_time = time.time()
 
@@ -168,7 +176,7 @@ if __name__ == "__main__":
     for epoch in range(start_epoch, args.epochs):
         # start_step 是上一次断点前最后完成的 step 索引
         # 判断是否需要跳过数据 (仅在恢复训练的那个 Epoch 生效)
-        if epoch == start_epoch and (start_epoch > 0 or start_step > 0):
+        if epoch == start_epoch and is_loaded:
             steps_to_skip = start_step + 1 
             if is_main_process:
                 print(f"正在从 Sampler 层面直接跳过前 {steps_to_skip} 个 Step 的数据...")
@@ -195,7 +203,7 @@ if __name__ == "__main__":
         for step, (input_ids, labels) in enumerate(dataloader):
             # 因为我们用了 SkipSampler，此时 enumerate 的 step 是从 0 重新开始计数的。
             # 为了让日志和保存逻辑依然对齐真实的全局进度，我们需要把真实的 step 算出来：
-            if epoch == start_epoch and (start_epoch > 0 or start_step > 0):
+            if epoch == start_epoch and is_loaded:
                 real_step = step + start_step + 1
             else:
                 real_step = step

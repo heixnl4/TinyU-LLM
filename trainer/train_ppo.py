@@ -18,7 +18,7 @@ from transformers import get_cosine_schedule_with_warmup
 from trainer.arguments import parse_ppo_args
 # 假设你在 utils 中补充了 PPO 相关的初始化和 GAE 计算函数
 from trainer.ppo_utils import init_ppo_models, generate_experience, compute_gae, gather_logprobs
-from trainer.train_utils import print_model_param_details, set_seed, save_checkpoint
+from trainer.train_utils import print_model_param_details, set_seed, save_checkpoint, SkipStepSampler
 from trainer.train_utils import load_checkpoint, setup_device_and_distributed, log_training_progress
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -81,12 +81,18 @@ if __name__ == "__main__":
     # PPO 阶段输入通常只有 Prompts，模型自己生成 Responses
     dataset = PromptDataset(args.data_path, tokenizer, args.max_prompt_length)
 
+    # 【改动 1】引入基础 Sampler，并创建一个基础的 DataLoader 用于计算真实的完整步数
     if is_distributed:
-        sampler = DistributedSampler(dataset)
-        dataloader = DataLoader(dataset, batch_size=args.rollout_batch_size, sampler=sampler, shuffle=False) 
+        base_sampler = DistributedSampler(dataset)
     else:
-        sampler = None
-        dataloader = DataLoader(dataset, batch_size=args.rollout_batch_size, shuffle=True)
+        from torch.utils.data import RandomSampler
+        base_sampler = RandomSampler(dataset)
+
+    # 强制开启 drop_last=True，防止 DDP 在最后一个不完整的 rollout_batch 处卡死
+    base_dataloader = DataLoader(
+        dataset, batch_size=args.rollout_batch_size, sampler=base_sampler, drop_last=True
+    )
+    full_dataloader_len = len(base_dataloader)
 
     # Actor 和 Critic 通常使用不同的学习率（Critic 往往需要更大的 LR）
     actor_optimizer = optim.AdamW(actor.parameters(), lr=args.actor_learning_rate)
@@ -102,9 +108,10 @@ if __name__ == "__main__":
 
     scaler = torch.amp.GradScaler("cuda", enabled=(ptdtype == torch.float16))
 
-    # PPO 的总更新步数 = (外层 Epoch * DataLoader长度) * (PPO 内部 Epoch 数量) / 累积步数
-    total_rollouts = args.epochs * len(dataloader)
-    total_update_steps = total_rollouts * args.ppo_epochs // args.accumulation_steps 
+    # PPO 的总更新步数 = (外层 Epoch * DataLoader长度) * (PPO 内部 Epoch 数量)
+    # 1个 rollout_batch 对应 1次 真实参数更新。
+    total_rollouts = args.epochs * full_dataloader_len
+    total_update_steps = total_rollouts * args.ppo_epochs
     warmup_steps = int(total_update_steps * 0.1)           
     
     actor_scheduler = get_cosine_schedule_with_warmup(actor_optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_update_steps)
@@ -115,13 +122,29 @@ if __name__ == "__main__":
     checkpoint_path = f"{current_ckpt_dir}/ppo_checkpoint.pth"
     
     # 需自行在 load_checkpoint 中兼容双 Optimizer 和双 Scheduler 的加载逻辑
-    start_epoch, start_step, swanlab_id = load_checkpoint(
+    load_epoch, load_step, swanlab_id = load_checkpoint(
         actor, actor_optimizer, actor_scheduler, scaler, checkpoint_path, device, is_distributed, 
         strict=False,
         critic=critic,
         critic_optimizer=critic_optimizer,
         critic_scheduler=critic_scheduler
     )
+
+    if load_epoch != -1:
+        is_loaded = True
+        start_epoch, start_step = load_epoch, load_step
+    else:
+        is_loaded = False
+        start_epoch = start_step = 0
+
+    if is_main_process:
+        print(f"使用设备：{device}，是否开启分布式: {is_distributed}")
+        print(f"已固定全局随机种子为: {args.seed}")
+        if is_loaded:
+            print(f"已从 checkpoint 中恢复训练，从第 {start_epoch + 1} 个 epoch 和第 {start_step + 1} 个 step 开始训练...")
+        else:
+            print("未找到 checkpoint，开始从零训练...") 
+        print(f"{'-'*50}")
 
     if is_main_process and args.use_swanlab:
         import swanlab 
@@ -137,16 +160,43 @@ if __name__ == "__main__":
     
     global_update_step = 0
     if start_epoch > 0 or start_step > 0:
-        global_update_step = (start_epoch * len(dataloader) + start_step + 1) // args.accumulation_steps
+        # 【改动 4】精准推算恢复训练时的全局步数（每个 batch 包含 ppo_epochs 次更新）
+        epoch_update_steps = load_epoch * full_dataloader_len * args.ppo_epochs
+        global_update_step = epoch_update_steps + (load_step + 1) * args.ppo_epochs    
+        
     start_time = time.time()
 
     for epoch in range(start_epoch, args.epochs):
-        if sampler is not None: 
+        # 【改动 5】引入 SkipStepSampler 进行 DataLoader 层面的精确断点跳步
+        if epoch == start_epoch and is_loaded:
+            steps_to_skip = start_step + 1 
+            if is_main_process:
+                print(f"正在从 Sampler 层面直接跳过前 {steps_to_skip} 个 Step 的数据...")
+            sampler = SkipStepSampler(base_sampler, steps_to_skip, args.rollout_batch_size)
+        else:
+            if is_main_process:
+                print(f"Epoch {epoch}: 使用完整数据集进行 Rollout...")
+            sampler = base_sampler
+
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=args.rollout_batch_size, 
+            sampler=sampler, 
+            shuffle=False,      
+            num_workers=0,      
+            pin_memory=True,    
+            drop_last=True  # 必须开启
+        )
+
+        if hasattr(sampler, 'set_epoch'):
             sampler.set_epoch(epoch)
 
         for step, prompt_batch in enumerate(dataloader):
-            if not (epoch == 0 and step == 0) and epoch == start_epoch and step <= start_step:
-                continue
+            # 【改动 6】映射真实的 Rollout Step
+            if epoch == start_epoch and is_loaded:
+                real_step = step + start_step + 1
+            else:
+                real_step = step
             
             # --- 阶段 A：经验收集 (Rollout) ---
             # 此阶段不需要梯度，使用 Actor 生成文本，并利用 Ref 和 Reward 模型评估
@@ -211,7 +261,7 @@ if __name__ == "__main__":
                             # ========== 1. 计算 Actor (Policy) Loss ==========
                             # 重新计算当前策略的 logprob
                             actor_outputs = actor(mb_inputs, attention_mask=mb_attention_mask)
-                            # 【修复点 1】截取与 Response 对应的 logits
+                            # 截取与 Response 对应的 logits
                             actor_logits = actor_outputs.logits[:, prompt_len - 1 : -1, :]
                             # 假设 get_logprobs 是从 logits 中提取 action 对应 logprob 的函数
                             new_logprobs = gather_logprobs(actor_logits, experience['actions'][start_idx:end_idx])
@@ -243,8 +293,8 @@ if __name__ == "__main__":
                             critic_loss_scaled = critic_loss / num_mini_batches
 
                             # 记录纯净的 Loss (脱离计算图)
-                            running_actor_loss += actor_loss_scaled.detach().float()
-                            running_critic_loss += critic_loss_scaled.detach().float()
+                            running_actor_loss += actor_loss_scaled.detach().float().item()
+                            running_critic_loss += critic_loss_scaled.detach().float().item()
 
                         # 分别反向传播
                         scaler.scale(actor_loss_scaled).backward()
@@ -277,11 +327,11 @@ if __name__ == "__main__":
                         # --- 日志记录 ---
                         if global_update_step % args.log_interval == 0 and is_main_process:
                             log_training_progress(
-                                start_epoch, start_step, step=step, epoch=epoch, epochs=args.epochs,
-                                dataloader_len=len(dataloader),
-                                total_steps=args.epochs * len(dataloader),
-                                loss_val=running_actor_loss.item(), # PPO 主 Loss
-                                aux_loss_val=running_critic_loss.item(), # 将 Critic Loss 作为 Aux 记录
+                                start_epoch, start_step, step=real_step, epoch=epoch, epochs=args.epochs,
+                                dataloader_len=full_dataloader_len,
+                                total_steps=args.epochs * full_dataloader_len,
+                                loss_val=running_actor_loss, # PPO 主 Loss
+                                aux_loss_val=running_critic_loss, # 将 Critic Loss 作为 Aux 记录
                                 lr=actor_optimizer.param_groups[0]['lr'],
                                 start_time=start_time,
                                 use_swanlab=args.use_swanlab,
