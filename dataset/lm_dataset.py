@@ -93,7 +93,6 @@ class SFTDataset(Dataset):
     def __len__(self):
         return len(self.data)
     
-    # 简易实现
     def __getitem__(self, index):
         sample = self.data[index]
         
@@ -242,3 +241,86 @@ class SFTDataset(Dataset):
         # ================= 4. 返回张量 =================
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)'''
 
+
+class PromptDataset(Dataset):
+    def __init__(self, data_path, tokenizer, max_prompt_length):
+        """
+        PPO Prompt 数据集 (基于 HuggingFace datasets)
+        :param data_path: jsonl 数据集路径
+        :param tokenizer: 模型的 tokenizer
+        :param max_prompt_length: prompt 的最大截断长度
+        """
+        self.tokenizer = tokenizer
+        self.max_prompt_length = max_prompt_length
+
+        # ================= 1. Tokenizer 预设 =================
+        # PPO 阶段生成文本，必须保证 Padding 在左侧
+        if self.tokenizer.padding_side != 'left':
+            print("【警告】检测到 Tokenizer padding_side 不是 'left'！PPO 生成阶段强制修改为左侧填充。")
+            self.tokenizer.padding_side = 'left'
+            
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # ================= 2. 加载数据集 =================
+        # 使用 Hugging Face 的 load_dataset 读取 jsonl
+        raw_dataset = load_dataset("json", data_files=data_path, split="train")
+
+        # ================= 3. 数据处理函数 =================
+        def process_fn(example):
+            user_prompt = ""
+            # 遍历 conversations，只提取 user 的提问
+            # 丢弃原数据里 assistant 对应的 "空"，因为 PPO 需要模型自己生成
+            for msg in example["conversations"]:
+                if msg.get("role") == "user":
+                    user_prompt = msg.get("content", "")
+                    break
+            
+            # 构造给模板使用的单轮对话格式
+            chat_msg = [{"role": "user", "content": user_prompt}]
+            
+            # 使用模型的 Chat Template
+            # add_generation_prompt=True 会自动在末尾加上助手生成的引导符
+            prompt_text = self.tokenizer.apply_chat_template(
+                chat_msg, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            
+            # 对文本进行 Tokenize 并填充截断
+            encoded = self.tokenizer(
+                prompt_text,
+                max_length=self.max_prompt_length,
+                truncation=True,
+                padding="max_length"
+            )
+            
+            return {
+                "input_ids": encoded["input_ids"],
+                "attention_mask": encoded["attention_mask"]
+            }
+
+        # ================= 4. 批量映射与格式化 =================
+        print("正在使用多线程处理 PPO Prompt 数据集...")
+        # 使用 map 加速处理，处理完后删除原始的无关列（如原文本等），只保留需要的 tensor 字段
+        self.dataset = raw_dataset.map(
+            process_fn, 
+            remove_columns=raw_dataset.column_names,
+            desc="Tokenizing prompts"
+        )
+        
+        # 强制将 dataset 的输出转为 PyTorch Tensor 格式
+        self.dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
+        
+        print(f"成功加载并处理完成，共包含 {len(self.dataset)} 条有效数据。")
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        # 由于上面已经使用了 set_format("torch")
+        # 这里取出的直接就是字典格式的 Tensor， DataLoader 可以直接打包
+        return {
+            "input_ids": self.dataset[idx]["input_ids"],
+            "attention_mask": self.dataset[idx]["attention_mask"]
+        }

@@ -72,26 +72,11 @@ if __name__ == "__main__":
         from torch.utils.data import RandomSampler, SequentialSampler
         base_sampler = RandomSampler(dataset)
 
-    # 2. 判断是否需要跳过数据 (仅在恢复训练的那个 Epoch 生效)
-    # 注意：start_step 是上一次断点前最后完成的 step 索引
-    if start_epoch > 0 or start_step > 0:
-        # 比如断点保存在 step 3 (第4个batch)，那么我们要跳过前 4 个 step
-        steps_to_skip = start_step + 1 
-        print(f"正在从 Sampler 层面直接跳过前 {steps_to_skip} 个 Step 的数据...")
-        sampler = SkipStepSampler(base_sampler, steps_to_skip, args.batch_size)
-    else:
-        sampler = base_sampler
-
-    # 3. 初始化 DataLoader
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=args.batch_size, 
-        sampler=sampler, 
-        shuffle=False,      # 使用了 Sampler，这里必须是 False
-        num_workers=4,      # 记得加上多进程
-        pin_memory=True,    # 记得开启锁页内存
-        drop_last=True
+    # 先创建一个基础的、不跳步的 DataLoader，仅用于计算正确的总步数
+    base_dataloader = DataLoader(
+        dataset, batch_size=args.batch_size, sampler=base_sampler, drop_last=True
     )
+    full_dataloader_len = len(base_dataloader)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     # ================= 5. 初始化混合精度与余弦退火 =================
@@ -113,7 +98,7 @@ if __name__ == "__main__":
 
     # 计算真实的总更新步数
     # 确保与实际发生的 update_step 次数绝对一致
-    total_update_steps = args.epochs * math.ceil(len(dataloader) / args.accumulation_steps)    
+    total_update_steps = args.epochs * math.ceil(full_dataloader_len / args.accumulation_steps)    
     # 拿出前 10% 的步数做预热 (Warmup)
     warmup_steps = int(total_update_steps * 0.1)           
     # 初始化学习率调度器
@@ -141,7 +126,7 @@ if __name__ == "__main__":
         if not start_epoch and not start_step:
             print("未找到 checkpoint，开始从零训练...") 
         else:
-            print(f"已从 checkpoint 中恢复训练，从第 {start_epoch} 个 epoch 和第 {start_step} 个 step 开始训练...")
+            print(f"已从 checkpoint 中恢复训练，从第 {start_epoch + 1} 个 epoch 和第 {start_step + 1} 个 step 开始训练...")
         print(f"{'-'*50}")
         
 
@@ -175,14 +160,36 @@ if __name__ == "__main__":
     global_update_step = 0
     if start_epoch > 0 or start_step > 0:
         # 根据已练过的数据量推算真实的全局更新步数
-        global_update_step = (start_epoch * len(dataloader) + start_step + 1) // args.accumulation_steps
+        global_update_step = (start_epoch * full_dataloader_len + start_step + 1) // args.accumulation_steps
     # 记录整个训练开始的时间
     start_time = time.time()
 
     # 如果是恢复训练则从 start_epoch 开始，如果没有 checkpoint 则 start_epoch 默认为0
     for epoch in range(start_epoch, args.epochs):
+        # start_step 是上一次断点前最后完成的 step 索引
+        # 判断是否需要跳过数据 (仅在恢复训练的那个 Epoch 生效)
+        if epoch == start_epoch and (start_epoch > 0 or start_step > 0):
+            steps_to_skip = start_step + 1 
+            if is_main_process:
+                print(f"正在从 Sampler 层面直接跳过前 {steps_to_skip} 个 Step 的数据...")
+            sampler = SkipStepSampler(base_sampler, steps_to_skip, args.batch_size)
+        else:
+            if is_main_process:
+                print(f"Epoch {epoch}: 使用完整数据集训练...")
+            sampler = base_sampler
+
+        # 3. 初始化 DataLoader
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=args.batch_size, 
+            sampler=sampler, 
+            shuffle=False,      # 使用了 Sampler，这里必须是 False
+            num_workers=0,      # 记得加上多进程
+            pin_memory=True,    # 记得开启锁页内存
+            drop_last=True
+        )
         # 必须加上这句：让采样器打乱每个 epoch 的数据顺序
-        if sampler is not None: 
+        if hasattr(sampler, 'set_epoch'):
             sampler.set_epoch(epoch)
 
         for step, (input_ids, labels) in enumerate(dataloader):
@@ -196,7 +203,7 @@ if __name__ == "__main__":
             input_ids = input_ids.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             # 判断当前 step 是否是累积的最后一步
-            is_update_step = (real_step + 1) % args.accumulation_steps == 0 or (real_step + 1) == len(dataloader)
+            is_update_step = (real_step + 1) % args.accumulation_steps == 0 or (real_step + 1) == full_dataloader_len
             
             # DDP 高级优化 防止无意义的梯度同步
             sync_context = model.no_sync if is_distributed and not is_update_step else nullcontext
@@ -212,9 +219,9 @@ if __name__ == "__main__":
                     loss = raw_main_loss + raw_aux_loss
 
                     # 动态计算当前的真实累积步数
-                    if (real_step + 1) == len(dataloader):
+                    if (real_step + 1) == full_dataloader_len:
                         # 算一下最后这一波攒了多少个 step
-                        current_accum_steps = len(dataloader) % args.accumulation_steps
+                        current_accum_steps = full_dataloader_len % args.accumulation_steps
                         if current_accum_steps == 0:
                             current_accum_steps = args.accumulation_steps
                     else:
@@ -280,8 +287,8 @@ if __name__ == "__main__":
                         step=real_step,
                         epoch=epoch,
                         epochs=args.epochs,
-                        dataloader_len=len(dataloader),
-                        total_steps=args.epochs * len(dataloader),
+                        dataloader_len=full_dataloader_len,
+                        total_steps=args.epochs * full_dataloader_len,
                         loss_val=avg_loss,
                         aux_loss_val=avg_aux_loss,
                         lr=optimizer.param_groups[0]['lr'],

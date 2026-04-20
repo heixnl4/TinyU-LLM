@@ -323,4 +323,20 @@ class TinyuForcausalLM(PreTrainedModel, GenerationMixin):
         
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
 
+    # 钩子函数 prepare_inputs_for_generation
+    # 如果不加这个函数，generate 无法知道在解码下一步时该如何截断 input_ids 并传入 past_key_values
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        # 如果传入了 past_key_values，说明当前正处于自回归的生成阶段（不是第一步的 Prefill）
+        # 此时只需要输入最后一个预测出的 token，以节省计算量
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache", True),
+            "attention_mask": attention_mask,
+        }
 

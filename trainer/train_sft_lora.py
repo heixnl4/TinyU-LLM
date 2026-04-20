@@ -173,7 +173,7 @@ if __name__ == "__main__":
     running_aux_loss = 0.0
     global_update_step = 0
     if start_epoch > 0 or start_step > 0:
-        global_update_step = (start_epoch * len(dataloader) + start_step) // args.accumulation_steps
+        global_update_step = (start_epoch * len(dataloader) + start_step + 1) // args.accumulation_steps
     start_time = time.time()
 
     for epoch in range(start_epoch, args.epochs):

@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from transformers import TextStreamer # 或者使用你自定义的 Tokenizer 导入方式
 from model.configuration import TinyuConfig
-from trainer.train_utils import init_model
+from trainer.train_utils import init_model, print_model_param_details
 from trainer.arguments import inference_args
 
 # ================= 1. 核心采样算法 =================
@@ -131,7 +131,7 @@ def main():
     arch_signature = f"h{args.hidden_size}_l{args.num_hidden_layers}_ah{args.num_attention_heads}_moe{int(args.use_moe)}"
     output_dir = os.path.join(args.output_dir, f"{args.run_name}_{arch_signature}")
     os.makedirs(output_dir, exist_ok=True)
-    checkpoint_path = f"{output_dir}/pretrain_checkpoint.pth" 
+    checkpoint_path = f"{output_dir}/pretrain_epoch_0.pth" 
     tokenizer_path = "./model" 
     
     # 2. 初始化模型架构 (需要和预训练时保持绝对一致)
@@ -142,6 +142,7 @@ def main():
         num_key_value_heads=2,
     )
     model, tokenizer = init_model(config, tokenizer_path, device=device)
+    print_model_param_details(model, detail=True)
 
     
     # 3. 剥离 DDP 的 `module.` 前缀并加载权重，单卡训练不需要

@@ -1,7 +1,9 @@
 import math
 import torch
+import os
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import OrderedDict
 
 # ================= 1. LoRA 线性层核心实现 =================
 class LoRALinear(nn.Module):
@@ -106,3 +108,99 @@ def print_trainable_parameters(model: nn.Module):
             trainable_params += num_params
             
     print(f"📊 可训练参数: {trainable_params:,d} || 全部参数: {all_param:,d} || 可训练比例: {100 * trainable_params / all_param:.4f}%")
+
+
+
+def merge_lora_weights(base_model_path, lora_model_path, output_path, r=8, lora_alpha=32.0):
+    """
+    将 LoRA 权重离线合并回预训练基座权重中。
+    
+    :param base_model_path: 预训练基座权重的路径 (.pth)
+    :param lora_model_path: SFT 训练得到的纯 LoRA 权重路径 (.pth)
+    :param output_path: 合并后新权重的保存路径
+    :param r: 训练 LoRA 时使用的 rank
+    :param lora_alpha: 训练 LoRA 时使用的 alpha
+    """
+    print("开始合并 LoRA 权重...")
+    
+    # 1. 加载基座权重 (放到 CPU 上进行，防止撑爆显存)
+    print(f"正在加载基座权重: {base_model_path}")
+    base_state_dict = torch.load(base_model_path, map_location="cpu")
+    
+    # 清洗 DDP 带来的 "module." 前缀（如果有的话）
+    base_state_dict = {
+        k.replace("module.", "") if k.startswith("module.") else k: v 
+        for k, v in base_state_dict.items()
+    }
+    
+    # 2. 加载 LoRA 权重
+    print(f"正在加载 LoRA 权重: {lora_model_path}")
+    lora_state_dict = torch.load(lora_model_path, map_location="cpu")
+    lora_state_dict = {
+        k.replace("module.", "") if k.startswith("module.") else k: v 
+        for k, v in lora_state_dict.items()
+    }
+
+    # 计算缩放因子
+    scaling = lora_alpha / r
+    print(f"LoRA 缩放因子 (alpha/r): {scaling}")
+
+    # 3. 提取所有的 LoRA 目标层前缀
+    # lora_state_dict 里的键名类似: "layers.0.attention.q_proj.lora_A"
+    # 我们要提取出 "layers.0.attention.q_proj" 作为归类标识
+    lora_keys = set()
+    for key in lora_state_dict.keys():
+        if "lora_A" in key or "lora_B" in key:
+            # 剥离最后的 .lora_A 或 .lora_B
+            base_key = key.replace(".lora_A", "").replace(".lora_B", "")
+            lora_keys.add(base_key)
+
+    # 4. 执行矩阵合并
+    merged_state_dict = OrderedDict(base_state_dict)
+    merged_count = 0
+    
+    for base_key in lora_keys:
+        lora_A_key = f"{base_key}.lora_A"
+        lora_B_key = f"{base_key}.lora_B"
+        
+        # ⚠️ 避坑：基座权重的键名通常是 "xxx.weight"
+        # 但在我们的手写注入逻辑中，原来叫 weight 的参数被包装到了 original_linear.weight 里
+        # 为了通用性，我们直接定位合并后要写回的键名，通常基座里是 base_key + ".weight"
+        target_base_weight_key = f"{base_key}.weight"
+        
+        # 如果找不到标准的 weight 键名，可能因为基座本身有前缀，做个兼容检查
+        if target_base_weight_key not in merged_state_dict:
+            # 尝试找带 original_linear 的
+            alt_key = f"{base_key}.original_linear.weight"
+            if alt_key in merged_state_dict:
+                target_base_weight_key = alt_key
+            else:
+                print(f"找不到 {base_key} 对应的基座权重，跳过合并。")
+                continue
+
+        # 提取张量
+        # 将所有张量升频到 FP32 进行高精度乘加计算，计算出完美的数值后，再降回 BF16/FP16 覆盖回去
+        lora_A_tensor = lora_state_dict[lora_A_key].to(torch.float32)
+        lora_B_tensor = lora_state_dict[lora_B_key].to(torch.float32)
+        base_weight_tensor = merged_state_dict[target_base_weight_key].to(torch.float32)
+
+        # 核心数学操作：W_new = W_base + (B @ A) * scaling
+        # PyTorch 的 Linear 权重形状是 [out_features, in_features]
+        # A 是 [r, in_features], B 是 [out_features, r]
+        # 所以 B @ A 的结果刚好是 [out_features, in_features]
+        delta_weight = (lora_B_tensor @ lora_A_tensor) * scaling
+        
+        # 加和并恢复回原来的精度类型 (比如 bfloat16 或 float16)
+        merged_weight = (base_weight_tensor + delta_weight).to(merged_state_dict[target_base_weight_key].dtype)
+        
+        # 更新字典
+        merged_state_dict[target_base_weight_key] = merged_weight
+        merged_count += 1
+
+    # 5. 保存合并后的全新基座模型
+    print(f"成功合并了 {merged_count} 个权重矩阵！")
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    print(f"正在保存合并后的模型至: {output_path}")
+    torch.save(merged_state_dict, output_path)
+    print("合并完成！")
