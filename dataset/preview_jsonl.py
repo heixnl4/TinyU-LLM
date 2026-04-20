@@ -27,4 +27,4 @@ def preview_jsonl(file_path, num_lines=3, start_line=0):
                 print(line.strip())
 
 
-preview_jsonl('dataset\dpo.jsonl', num_lines=3, start_line=0)
+preview_jsonl('.\sft_mini_512.jsonl', num_lines=3, start_line=0)

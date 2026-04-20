@@ -10,6 +10,8 @@ import random         # Python 原生随机库
 import numpy as np    # NumPy 库
 import torch
 import torch.distributed as dist
+from torch.utils.data import Sampler
+from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoTokenizer
 from model.model_Tinyu import TinyuForcausalLM
 
@@ -48,10 +50,16 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 # Checkpoint 保存函数
-def save_checkpoint(model, optimizer, scheduler, scaler, epoch, step, path, is_distributed, swanlab_id):
+def save_checkpoint(model, optimizer, scheduler, scaler, epoch, step, path, is_distributed, swanlab_id, only_lora=False, **kwargs):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # 如果是分布式训练，需要取 model.module
     model_state = model.module.state_dict() if is_distributed else model.state_dict()
+
+    # 仅保存 LoRA 参数
+    if only_lora:
+        lora_state = {k: v for k, v in model_state.items() if 'lora_A' in k or 'lora_B' in k}
+        model_state = lora_state
+        print(f"已过滤出 {len(model_state)} 个 LoRA 参数进行保存。")
     
     checkpoint = {
         'epoch': epoch,
@@ -62,26 +70,58 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, step, path, is_d
         'scaler_state_dict': scaler.state_dict(),
         'swanlab_id': swanlab_id
     }
+
+    # 其他参数，如ppo中的critic模型
+    for key, value in kwargs.items():
+            if value is not None:
+                if hasattr(value, 'state_dict'):
+                    raw_value = value.module if isinstance(value, DistributedDataParallel) else value
+                    raw_value = getattr(raw_value, '_orig_mod', raw_value)
+                    checkpoint[key] = raw_value.state_dict()
+                else:
+                    checkpoint[key] = value
+
     torch.save(checkpoint, path)
     print(f"--- Checkpoint 已保存至: {path} ---")
 
 # Checkpoint 读取函数
-def load_checkpoint(model, optimizer, scheduler, scaler, path, device, is_distributed):
+def load_checkpoint(model, optimizer, scheduler, scaler, path, device, is_distributed, strict=True, **kwargs):
     if not os.path.exists(path):
-        return 0, 0, None
+        return -1, -1, None
         
     print(f"--- 正在从 Checkpoint 恢复: {path} ---")
     checkpoint = torch.load(path, map_location=device)
-    
-    # 加载权重
+    # ================= 1. 恢复基础组件 =================
+    # 核心加载逻辑：如果是 SFT 恢复，strict 必须传 False
+    # strict=False 只加载字典里有的，没找到的保持刚加载的预训练基座权重”。
     if is_distributed:
-        model.module.load_state_dict(checkpoint['model_state_dict'])
+        model.module.load_state_dict(checkpoint['model_state_dict'], strict=strict)
     else:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
         
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+    # ================= 2. 动态恢复 kwargs 里的附加组件 =================
+    for key, obj in kwargs.items():
+        if key in checkpoint:
+            if hasattr(obj, 'load_state_dict'):
+                # 剥离 DDP 包装（如果传入的是个被包裹的模型）
+                raw_obj = obj.module if isinstance(obj, DistributedDataParallel) else obj
+                
+                # 模型 (nn.Module) 的 load_state_dict 支持 strict 参数，而优化器/调度器不支持
+                if isinstance(raw_obj, torch.nn.Module):
+                    raw_obj.load_state_dict(checkpoint[key], strict=strict)
+                else:
+                    raw_obj.load_state_dict(checkpoint[key])
+                    
+                print(f"已动态恢复附加状态: {key}")
+            else:
+                # 对于非 state_dict 对象（如布尔值、字符串），无法就地更新
+                print(f"警告: '{key}' 没有 load_state_dict 方法，跳过动态加载。")
+        else:
+            print(f"警告: Checkpoint 文件中未找到 '{key}'，跳过加载。")
     
     return checkpoint['epoch'], checkpoint['step'], checkpoint.get('swanlab_id', None)
 
@@ -112,7 +152,7 @@ def setup_device_and_distributed():
 def log_training_progress(start_epoch, start_step, step, epoch, epochs, dataloader_len, total_steps, 
                           loss_val, aux_loss_val, lr, start_time, use_swanlab):
     # 1. 计算当前全局进度
-    global_step = step + (epoch * dataloader_len)
+    global_step = step + 1 + (epoch * dataloader_len)
     calc_step = global_step if global_step > 0 else 1
 
     # 2. 计算耗时与 ETA
@@ -139,3 +179,32 @@ def log_training_progress(start_epoch, start_step, step, epoch, epochs, dataload
             "train/step": global_step, 
             "train/elapsed_hours": elapsed_seconds / 3600 
         })
+
+
+class SkipStepSampler(Sampler):
+    """
+    一个用于断点恢复的 Sampler 包装器。
+    它会在迭代时直接截断掉前 N 个 step 对应的索引，从而完美避开数据的硬盘 IO 读取。
+    """
+    def __init__(self, base_sampler, skip_steps, batch_size):
+        self.base_sampler = base_sampler
+        # 换算成需要跳过的样本总数 (每张卡单独跳过自己的部分)
+        self.skip_samples = skip_steps * batch_size
+
+    def __iter__(self):
+        # 拿到原始 Sampler 排好序/打乱后的所有索引
+        indices = list(iter(self.base_sampler))
+        
+        # 核心：直接在索引列表上进行切片截断
+        if self.skip_samples >= len(indices):
+            return iter([])
+            
+        return iter(indices[self.skip_samples:])
+
+    def __len__(self):
+        return max(0, len(self.base_sampler) - self.skip_samples)
+
+    def set_epoch(self, epoch):
+        # 兼容 DistributedSampler 的打乱机制
+        if hasattr(self.base_sampler, 'set_epoch'):
+            self.base_sampler.set_epoch(epoch)

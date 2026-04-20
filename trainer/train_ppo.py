@@ -1,0 +1,376 @@
+import os
+import sys
+
+__package__ = "trainer"
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+import time
+import datetime
+import torch
+import math
+import torch.distributed as dist
+from torch import optim
+from torch.utils.data import DataLoader
+from model.configuration import TinyuConfig
+# PPO 需要专门的 Prompt 数据集
+from dataset.lm_dataset import PromptDataset 
+from transformers import get_cosine_schedule_with_warmup
+from trainer.arguments import parse_ppo_args
+# 假设你在 utils 中补充了 PPO 相关的初始化和 GAE 计算函数
+from trainer.ppo_utils import init_ppo_models, generate_experience, compute_gae, gather_logprobs
+from trainer.train_utils import print_model_param_details, set_seed, save_checkpoint, SkipStepSampler
+from trainer.train_utils import load_checkpoint, setup_device_and_distributed, log_training_progress
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from contextlib import nullcontext
+import torch.nn.functional as F
+
+if __name__ == "__main__":
+    # ================= 0. 获取全局配置 =================
+    args = parse_ppo_args()
+    # rollout_batch_size 小于 accumulation_steps 会导致 mini_batch_size 为 0，start_idx 会越界
+    assert args.rollout_batch_size >= args.accumulation_steps
+    arch_signature = f"h{args.hidden_size}_l{args.num_hidden_layers}_ah{args.num_attention_heads}_ppo"
+
+    # ================= 1. 初始化分布式环境 =================
+    device, local_rank, is_distributed, is_main_process = setup_device_and_distributed()
+    set_seed(args.seed + local_rank)
+
+    # ================= 2. 初始化模型与数据 =================
+    config = TinyuConfig(
+        hidden_size=args.hidden_size, 
+        num_hidden_layers=args.num_hidden_layers,
+        num_attention_heads=args.num_attention_heads,
+        num_key_value_heads=args.num_key_value_heads,
+        use_moe=args.use_moe
+    )
+
+    # PPO 需要 4 个模型: 
+    # 1. actor: 正在训练的策略模型 (从 SFT 初始化)
+    # 2. critic: 正在训练的价值模型 (从 Reward 初始化)
+    # 3. ref_model: 参考模型，用于计算 KL 散度 (冻结，从 SFT 初始化)
+    # 4. reward_model: 奖励模型，用于打分 (冻结)
+    actor, critic, ref_model, reward_model, tokenizer = init_ppo_models(config, args.model_paths, device=device)
+
+    # 冻结 Reference 和 Reward 模型
+    for model in [ref_model, reward_model]:
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+
+    if is_main_process:
+        print("Actor Model Params:")
+        print_model_param_details(actor, detail=False)
+        print("Critic Model Params:")
+        print_model_param_details(critic, detail=False)
+
+    # ================= 3. 模型编译与 DDP 包装 =================
+    if args.use_compile:
+        if is_main_process: print("正在使用 torch.compile 编译模型...")
+        actor = torch.compile(actor)
+        critic = torch.compile(critic)
+
+    if is_distributed:
+        actor._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
+        critic._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
+        # 只有 actor 和 critic 需要被 DDP 包装并进行梯度同步
+        actor = DDP(actor, device_ids=[local_rank])
+        critic = DDP(critic, device_ids=[local_rank])
+
+    # ================= 4. 数据集与优化器 =================
+    # PPO 阶段输入通常只有 Prompts，模型自己生成 Responses
+    dataset = PromptDataset(args.data_path, tokenizer, args.max_prompt_length)
+
+    # 【改动 1】引入基础 Sampler，并创建一个基础的 DataLoader 用于计算真实的完整步数
+    if is_distributed:
+        base_sampler = DistributedSampler(dataset)
+    else:
+        from torch.utils.data import RandomSampler
+        base_sampler = RandomSampler(dataset)
+
+    # 强制开启 drop_last=True，防止 DDP 在最后一个不完整的 rollout_batch 处卡死
+    base_dataloader = DataLoader(
+        dataset, batch_size=args.rollout_batch_size, sampler=base_sampler, drop_last=True
+    )
+    full_dataloader_len = len(base_dataloader)
+
+    # Actor 和 Critic 通常使用不同的学习率（Critic 往往需要更大的 LR）
+    actor_optimizer = optim.AdamW(actor.parameters(), lr=args.actor_learning_rate)
+    critic_optimizer = optim.AdamW(critic.parameters(), lr=args.critic_learning_rate)
+
+    # ================= 5. 初始化混合精度与余弦退火 =================
+    ptdtype = torch.float16
+    if args.dtype == "bfloat16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        ptdtype = torch.bfloat16
+        if is_main_process: print("硬件支持 BF16，已开启 Bfloat16 混合精度训练")
+    elif args.dtype == "float32":
+        ptdtype = torch.float32
+
+    scaler = torch.amp.GradScaler("cuda", enabled=(ptdtype == torch.float16))
+
+    # PPO 的总更新步数 = (外层 Epoch * DataLoader长度) * (PPO 内部 Epoch 数量)
+    # 1个 rollout_batch 对应 1次 真实参数更新。
+    total_rollouts = args.epochs * full_dataloader_len
+    total_update_steps = total_rollouts * args.ppo_epochs
+    warmup_steps = int(total_update_steps * 0.1)           
+    
+    actor_scheduler = get_cosine_schedule_with_warmup(actor_optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_update_steps)
+    critic_scheduler = get_cosine_schedule_with_warmup(critic_optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_update_steps)
+
+    # ================= 6. checkpoint 检查 =================
+    current_ckpt_dir = os.path.join(args.checkpoint_dir, f"{args.run_name}_{arch_signature}")
+    checkpoint_path = f"{current_ckpt_dir}/ppo_checkpoint.pth"
+    
+    # 需自行在 load_checkpoint 中兼容双 Optimizer 和双 Scheduler 的加载逻辑
+    load_epoch, load_step, swanlab_id = load_checkpoint(
+        actor, actor_optimizer, actor_scheduler, scaler, checkpoint_path, device, is_distributed, 
+        strict=False,
+        critic=critic,
+        critic_optimizer=critic_optimizer,
+        critic_scheduler=critic_scheduler
+    )
+
+    if load_epoch != -1:
+        is_loaded = True
+        start_epoch, start_step = load_epoch, load_step
+    else:
+        is_loaded = False
+        start_epoch = start_step = 0
+
+    if is_main_process:
+        print(f"使用设备：{device}，是否开启分布式: {is_distributed}")
+        print(f"已固定全局随机种子为: {args.seed}")
+        if is_loaded:
+            print(f"已从 checkpoint 中恢复训练，从第 {start_epoch + 1} 个 epoch 和第 {start_step + 1} 个 step 开始训练...")
+        else:
+            print("未找到 checkpoint，开始从零训练...") 
+        print(f"{'-'*50}")
+
+    if is_main_process and args.use_swanlab:
+        import swanlab 
+        swanlab_id = swanlab_id if swanlab_id else None
+        run = swanlab.init(project=args.project_name, name=args.run_name, config=vars(args), id=swanlab_id, resume=swanlab_id)
+        swanlab_id = getattr(swanlab, 'id', None)
+
+    # ================= 7. 训练循环 =================
+    actor.train()
+    critic.train()
+    actor_optimizer.zero_grad()
+    critic_optimizer.zero_grad()
+    
+    global_update_step = 0
+    if start_epoch > 0 or start_step > 0:
+        # 【改动 4】精准推算恢复训练时的全局步数（每个 batch 包含 ppo_epochs 次更新）
+        epoch_update_steps = load_epoch * full_dataloader_len * args.ppo_epochs
+        global_update_step = epoch_update_steps + (load_step + 1) * args.ppo_epochs    
+        
+    start_time = time.time()
+
+    for epoch in range(start_epoch, args.epochs):
+        # 【改动 5】引入 SkipStepSampler 进行 DataLoader 层面的精确断点跳步
+        if epoch == start_epoch and is_loaded:
+            steps_to_skip = start_step + 1 
+            if is_main_process:
+                print(f"正在从 Sampler 层面直接跳过前 {steps_to_skip} 个 Step 的数据...")
+            sampler = SkipStepSampler(base_sampler, steps_to_skip, args.rollout_batch_size)
+        else:
+            if is_main_process:
+                print(f"Epoch {epoch}: 使用完整数据集进行 Rollout...")
+            sampler = base_sampler
+
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=args.rollout_batch_size, 
+            sampler=sampler, 
+            shuffle=False,      
+            num_workers=0,      
+            pin_memory=True,    
+            drop_last=True  # 必须开启
+        )
+
+        if hasattr(sampler, 'set_epoch'):
+            sampler.set_epoch(epoch)
+
+        for step, prompt_batch in enumerate(dataloader):
+            # 【改动 6】映射真实的 Rollout Step
+            if epoch == start_epoch and is_loaded:
+                real_step = step + start_step + 1
+            else:
+                real_step = step
+            
+            # --- 阶段 A：经验收集 (Rollout) ---
+            # 此阶段不需要梯度，使用 Actor 生成文本，并利用 Ref 和 Reward 模型评估
+            with torch.no_grad():
+                # 1. 生成 Response，并计算 Old Logprobs, Values, Rewards, 和 KL Penalty
+                # 这里 generate_experience 是一个高度封装的函数
+                experience = generate_experience(
+                    actor, critic, ref_model, reward_model, 
+                    prompt_batch, tokenizer, device, ptdtype,
+                    max_response_length=args.max_response_length
+                )
+                
+                # 2. 计算 GAE (广义优势估计) 和 Returns
+                advantages, returns = compute_gae(
+                    experience['rewards'], experience['values'], 
+                    experience['response_mask'],
+                    gamma=args.gamma, lam=args.gae_lambda
+                )
+                
+                # 标准化优势函数，提升训练稳定性
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            # --- 阶段 B：PPO 模型更新 ---
+            # 对收集到的一批经验进行多次 PPO 迭代更新
+            
+            # 初始化 PPO epoch 的 loss 记录
+            running_actor_loss, running_critic_loss = 0.0, 0.0
+            
+            for ppo_epoch in range(args.ppo_epochs):
+                # 如果显存不够，可以将 experience 切分成更小的 mini_batch
+                # 这里为了配合你原本的 accum 结构，假设我们直接在完整 batch 上进行累积切片
+                
+                total_size = len(experience['prompts'])
+                # 模拟大 Batch 分步前向以节省显存 (Gradient Accumulation)
+                num_mini_batches = args.accumulation_steps
+                # 在进入 for i in range(num_mini_batches): 循环前，先获取 prompt_len
+                prompt_len = experience['prompts'].shape[1]
+
+                for i in range(num_mini_batches):
+                    # 获取 mini-batch 数据切片
+                    # 利用比例和整除，动态确定起止索引
+                    start_idx = i * total_size // num_mini_batches
+                    end_idx = (i + 1) * total_size // num_mini_batches
+                    
+                    mb_inputs = experience['input_ids'][start_idx:end_idx]
+                    mb_old_logprobs = experience['logprobs'][start_idx:end_idx]
+                    mb_advantages = advantages[start_idx:end_idx]
+                    mb_returns = returns[start_idx:end_idx]
+                    mb_old_values = experience['values'][start_idx:end_idx]
+                    mb_mask = experience['response_mask'][start_idx:end_idx]
+                    mb_attention_mask = experience['attention_mask'][start_idx:end_idx] # 补充这行
+                    
+                    is_update_step = (i + 1) == num_mini_batches
+
+                    # DDP 上下文同步
+                    actor_sync = actor.no_sync if is_distributed and not is_update_step else nullcontext
+                    critic_sync = critic.no_sync if is_distributed and not is_update_step else nullcontext
+
+                    with actor_sync(), critic_sync():
+                        with torch.autocast(device_type="cuda", dtype=ptdtype):
+                            
+                            # ========== 1. 计算 Actor (Policy) Loss ==========
+                            # 重新计算当前策略的 logprob
+                            actor_outputs = actor(mb_inputs, attention_mask=mb_attention_mask)
+                            # 截取与 Response 对应的 logits
+                            actor_logits = actor_outputs.logits[:, prompt_len - 1 : -1, :]
+                            # 假设 get_logprobs 是从 logits 中提取 action 对应 logprob 的函数
+                            new_logprobs = gather_logprobs(actor_logits, experience['actions'][start_idx:end_idx])
+                            
+                            # 重要性采样比率 (Importance Sampling Ratio)
+                            ratio = torch.exp(new_logprobs - mb_old_logprobs)
+                            
+                            # PPO 截断机制 (Clipped Surrogate Objective)
+                            pg_loss1 = -mb_advantages * ratio
+                            pg_loss2 = -mb_advantages * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
+                            # 使用 Mask 计算真实有效 Token 的平均值
+                            actor_loss_unreduced = torch.max(pg_loss1, pg_loss2) * mb_mask
+                            actor_loss = actor_loss_unreduced.sum() / (mb_mask.sum() + 1e-8)
+
+                            # ========== 2. 计算 Critic (Value) Loss ==========
+                            new_values_full = critic(mb_inputs, attention_mask=mb_attention_mask).squeeze(-1)
+                            # 【修复点 2】截取与 Response 对应的 Values
+                            new_values = new_values_full[:, prompt_len - 1 : -1]
+                            # Value Clip 机制，防止 Value 网络更新跨度过大
+                            vpredclipped = mb_old_values + torch.clamp(new_values - mb_old_values, -args.cliprange_value, args.cliprange_value)
+                            vf_losses1 = (new_values - mb_returns) ** 2
+                            vf_losses2 = (vpredclipped - mb_returns) ** 2
+
+                            critic_loss_unreduced = 0.5 * torch.max(vf_losses1, vf_losses2) * mb_mask
+                            critic_loss = critic_loss_unreduced.sum() / (mb_mask.sum() + 1e-8)
+
+                            # 按累积步数平均 Loss
+                            actor_loss_scaled = actor_loss / num_mini_batches
+                            critic_loss_scaled = critic_loss / num_mini_batches
+
+                            # 记录纯净的 Loss (脱离计算图)
+                            running_actor_loss += actor_loss_scaled.detach().float().item()
+                            running_critic_loss += critic_loss_scaled.detach().float().item()
+
+                        # 分别反向传播
+                        scaler.scale(actor_loss_scaled).backward()
+                        scaler.scale(critic_loss_scaled).backward()
+
+                    if is_update_step:
+                        # 梯度裁剪
+                        scaler.unscale_(actor_optimizer)
+                        scaler.unscale_(critic_optimizer)
+                        torch.nn.utils.clip_grad_norm_(actor.parameters(), args.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(critic.parameters(), args.max_grad_norm)
+                        # Actor 更新
+                        actor_scale_before = scaler.get_scale()
+                        scaler.step(actor_optimizer)
+                        # Critic 更新
+                        scaler.step(critic_optimizer)
+                        
+                        scaler.update()
+                        actor_scale_after = scaler.get_scale()
+                        
+                        if actor_scale_before <= actor_scale_after:
+                            actor_scheduler.step()
+                            critic_scheduler.step()
+                        
+                        actor_optimizer.zero_grad()
+                        critic_optimizer.zero_grad()
+                        
+                        global_update_step += 1
+
+                        # --- 日志记录 ---
+                        if global_update_step % args.log_interval == 0 and is_main_process:
+                            log_training_progress(
+                                start_epoch, start_step, step=real_step, epoch=epoch, epochs=args.epochs,
+                                dataloader_len=full_dataloader_len,
+                                total_steps=args.epochs * full_dataloader_len,
+                                loss_val=running_actor_loss, # PPO 主 Loss
+                                aux_loss_val=running_critic_loss, # 将 Critic Loss 作为 Aux 记录
+                                lr=actor_optimizer.param_groups[0]['lr'],
+                                start_time=start_time,
+                                use_swanlab=args.use_swanlab,
+                            )
+                        
+                        running_actor_loss, running_critic_loss = 0.0, 0.0
+
+                        # --- 保存 Checkpoint ---
+                        if global_update_step > 0 and global_update_step % args.save_steps == 0 and is_main_process:
+                            # 记得在保存逻辑里同时保存 actor 和 critic
+                            save_checkpoint(
+                                actor, actor_optimizer, actor_scheduler, scaler, epoch, step, checkpoint_path, 
+                                is_distributed, swanlab_id,
+                                critic=critic,
+                                critic_optimizer=critic_optimizer,
+                                critic_scheduler=critic_scheduler
+                            )
+                # 清理那些已经 backward 过，但仍滞留在显存中的计算图中间变量
+                del actor_outputs, critic_loss, actor_loss, new_logprobs
+                torch.cuda.empty_cache()
+
+        # 每个 Epoch 结束后保存权重
+        if is_main_process:
+            actor_state = actor.module.state_dict() if is_distributed else actor.state_dict()
+            critic_state = critic.module.state_dict() if is_distributed else critic.state_dict()
+            
+            output_dir = os.path.join(args.output_dir, f"{args.run_name}_{arch_signature}")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            tag = "final" if epoch == (args.epochs - 1) else f"epoch_{epoch}"
+            torch.save(actor_state, f"{output_dir}/ppo_actor_{tag}.pth")
+            torch.save(critic_state, f"{output_dir}/ppo_critic_{tag}.pth")
+            print(f"Epoch {epoch} 结束，Actor & Critic 权重已保存！")
+
+    total_time = time.time() - start_time
+    print(f"PPO 训练完成！总耗时: {datetime.timedelta(seconds=int(total_time))}")
+    
+    if is_main_process and args.use_swanlab:
+        swanlab.finish()
+
+    if is_distributed:
+        dist.destroy_process_group()

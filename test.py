@@ -36,3 +36,10 @@ print(f"真实使用: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
 # 查看 PyTorch 向显卡总共申请了多少显存（接近你看到的 2GB）
 print(f"缓存池预留: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
 
+# tokenizer = AutoTokenizer.from_pretrained("../model")
+# dataset = PretrainDataset("../dataset/pretrain_hq.jsonl", tokenizer)
+# print("Raw text:", dataset.data[0]["text"]) 
+# input_ids, labels = dataset[0]  
+# print("input_ids:", input_ids)
+# print("labels:", labels)
+# print(len(dataset))
