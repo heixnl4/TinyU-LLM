@@ -48,6 +48,15 @@ def load_weights_safely(model, ckpt_path, device, model_name="Model"):
     if not ckpt_path:
         print(f"[{model_name}] 未提供权重路径，将使用随机初始化 (不推荐)。")
         return
+    
+    # 【新增逻辑】检查文件在磁盘上是否真实存在
+    if not os.path.exists(ckpt_path):
+        # 建议直接抛出异常而不是静默使用随机权重
+        # raise FileNotFoundError(f"[{model_name}] 严重错误：权重文件路径 '{ckpt_path}' 不存在！请检查路径是否拼写正确。")
+        
+        # 如果你依然希望它哪怕找不到也强行随机初始化跑下去，可以换成下面这两行：
+        print(f"[{model_name}] 严重警告：找不到权重文件 {ckpt_path}！将退化为随机初始化。")
+        return
 
     print(f"[{model_name}] 正在从 {ckpt_path} 加载权重...")
     state_dict = torch.load(ckpt_path, map_location=device, weights_only=True)
@@ -84,12 +93,12 @@ def init_ppo_models(config, model_paths, device):
     # ---------------- 2. 初始化 Critic 和 RM (价值架构) ----------------
     print(">>> 正在初始化 Critic 模型...")
     # 先用 init_model 创建骨架，再套上 ValueModel 的壳子
-    critic = TinyuValueModel(config, device=device).to(device)
+    critic = TinyuValueModel(config).to(device)
     # Critic 可以从 Reward Model 初始化（推荐），也可以从 SFT 初始化
     load_weights_safely(critic, rm_path or sft_path, device, "Critic")
 
     print(">>> 正在初始化 Reward 模型...")
-    reward_model = TinyuValueModel(config, device=device).to(device)
+    reward_model = TinyuValueModel(config).to(device)
     load_weights_safely(reward_model, rm_path, device, "Reward")
 
     # ---------------- 3. 设置模型状态 ----------------
@@ -171,9 +180,25 @@ def generate_experience(actor, critic, ref_model, reward_model, prompt_batch, to
         # (4) Reward Model 打分 -> 假设输出一个标量分数 (batch_size,)
         # 如果你的 RM 输出是 sequence，需要自己提取末尾有效 token 的打分
         rm_outputs = reward_model(full_input_ids, attention_mask=full_attention_mask)
-        # 此处做一个简单适配，假设 RM 直接吐出标量分或列表
-        rm_scores = rm_outputs.logits.squeeze(-1) if hasattr(rm_outputs, "logits") else rm_outputs
 
+        # ========== 鲁棒适配 RM 输出 ==========
+        # 1. 剥离模型包裹类
+        rm_tensor = rm_outputs.logits if hasattr(rm_outputs, "logits") else rm_outputs
+        # 2. 挤掉末尾可能存在的 size 为 1 的冗余维度: (B, 1)->(B) 或是 (B, L, 1)->(B, L)
+        rm_tensor = rm_tensor.squeeze(-1) 
+        
+        if rm_tensor.dim() == 1:
+            # 情况 A：模型已经是直接输出标量分了，形状为 (batch_size,)
+            rm_scores = rm_tensor
+        elif rm_tensor.dim() == 2:
+            # 情况 B：模型输出的是序列稠密分，形状为 (batch_size, seq_len)
+            # 计算每个 sequence 的实际长度（最后一个非 Pad Token 的索引）
+            last_valid_indices = full_attention_mask.sum(dim=-1) - 1
+            # 利用 gather 从序列中精准抽出那个最末尾词的得分
+            rm_scores = rm_tensor.gather(dim=1, index=last_valid_indices.unsqueeze(-1)).squeeze(-1)
+        else:
+            raise ValueError(f"未知的 Reward Model 输出维度: {rm_tensor.shape}，请检查模型骨干。")
+    
     # 5. 对齐 Logits 序列：
     # 对于因果语言模型，第 t 个位置的输出 logits 是用来预测第 t+1 个 token 的。
     # 因此我们要预测 response_tokens，需要使用 prompt_len - 1 到 -1 的 logits。
@@ -217,12 +242,13 @@ def generate_experience(actor, critic, ref_model, reward_model, prompt_batch, to
         "actions": responses,                    # Actor 实际选择的词
         "logprobs": actor_logprobs,              # Actor 选择这些词的旧概率 (old_logprobs)
         "values": values,                        # Critic 给出的估值
-        "rewards": rewards                       # 融合了 KL 的最终奖励序列
+        "rewards": rewards,                      # 融合了 KL 的最终奖励序列
+        "response_mask": response_attention_mask
     }
 
 
 @torch.no_grad()
-def compute_gae(rewards: torch.Tensor, values: torch.Tensor, gamma: float = 0.99, lam: float = 0.95):
+def compute_gae(rewards: torch.Tensor, values: torch.Tensor, response_attention_mask, gamma: float = 0.99, lam: float = 0.95, ):
     """
     计算广义优势估计 (GAE) 和 回报 (Returns)
     
@@ -265,5 +291,7 @@ def compute_gae(rewards: torch.Tensor, values: torch.Tensor, gamma: float = 0.99
     # 回报 (Returns) 是真实获得的价值，用来指导 Critic 网络更新自己
     # 数学上，Returns = Advantages + Values
     returns = advantages + values
+    advantages = advantages * response_attention_mask
+    returns = returns * response_attention_mask
     
     return advantages, returns

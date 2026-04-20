@@ -28,6 +28,8 @@ import torch.nn.functional as F
 if __name__ == "__main__":
     # ================= 0. 获取全局配置 =================
     args = parse_ppo_args()
+    # rollout_batch_size 小于 accumulation_steps 会导致 mini_batch_size 为 0，start_idx 会越界
+    assert args.rollout_batch_size >= args.accumulation_steps
     arch_signature = f"h{args.hidden_size}_l{args.num_hidden_layers}_ah{args.num_attention_heads}_ppo"
 
     # ================= 1. 初始化分布式环境 =================
@@ -115,7 +117,10 @@ if __name__ == "__main__":
     # 需自行在 load_checkpoint 中兼容双 Optimizer 和双 Scheduler 的加载逻辑
     start_epoch, start_step, swanlab_id = load_checkpoint(
         actor, actor_optimizer, actor_scheduler, scaler, checkpoint_path, device, is_distributed, 
-        critic, critic_optimizer, critic_scheduler
+        strict=False,
+        critic=critic,
+        critic_optimizer=critic_optimizer,
+        critic_scheduler=critic_scheduler
     )
 
     if is_main_process and args.use_swanlab:
@@ -140,7 +145,7 @@ if __name__ == "__main__":
             sampler.set_epoch(epoch)
 
         for step, prompt_batch in enumerate(dataloader):
-            if epoch == start_epoch and step <= start_step:
+            if not (epoch == 0 and step == 0) and epoch == start_epoch and step <= start_step:
                 continue
             
             # --- 阶段 A：经验收集 (Rollout) ---
@@ -150,12 +155,14 @@ if __name__ == "__main__":
                 # 这里 generate_experience 是一个高度封装的函数
                 experience = generate_experience(
                     actor, critic, ref_model, reward_model, 
-                    prompt_batch, tokenizer, device, ptdtype
+                    prompt_batch, tokenizer, device, ptdtype,
+                    max_response_length=args.max_response_length
                 )
                 
                 # 2. 计算 GAE (广义优势估计) 和 Returns
                 advantages, returns = compute_gae(
                     experience['rewards'], experience['values'], 
+                    experience['response_mask'],
                     gamma=args.gamma, lam=args.gae_lambda
                 )
                 
@@ -172,19 +179,25 @@ if __name__ == "__main__":
                 # 如果显存不够，可以将 experience 切分成更小的 mini_batch
                 # 这里为了配合你原本的 accum 结构，假设我们直接在完整 batch 上进行累积切片
                 
+                total_size = len(experience['prompts'])
                 # 模拟大 Batch 分步前向以节省显存 (Gradient Accumulation)
                 num_mini_batches = args.accumulation_steps
-                mini_batch_size = max(1, len(experience['prompts']) // num_mini_batches)
+                # 在进入 for i in range(num_mini_batches): 循环前，先获取 prompt_len
+                prompt_len = experience['prompts'].shape[1]
 
                 for i in range(num_mini_batches):
                     # 获取 mini-batch 数据切片
-                    start_idx = i * mini_batch_size
-                    end_idx = start_idx + mini_batch_size
+                    # 利用比例和整除，动态确定起止索引
+                    start_idx = i * total_size // num_mini_batches
+                    end_idx = (i + 1) * total_size // num_mini_batches
+                    
                     mb_inputs = experience['input_ids'][start_idx:end_idx]
                     mb_old_logprobs = experience['logprobs'][start_idx:end_idx]
                     mb_advantages = advantages[start_idx:end_idx]
                     mb_returns = returns[start_idx:end_idx]
                     mb_old_values = experience['values'][start_idx:end_idx]
+                    mb_mask = experience['response_mask'][start_idx:end_idx]
+                    mb_attention_mask = experience['attention_mask'][start_idx:end_idx] # 补充这行
                     
                     is_update_step = (i + 1) == num_mini_batches
 
@@ -197,9 +210,11 @@ if __name__ == "__main__":
                             
                             # ========== 1. 计算 Actor (Policy) Loss ==========
                             # 重新计算当前策略的 logprob
-                            actor_outputs = actor(mb_inputs)
+                            actor_outputs = actor(mb_inputs, attention_mask=mb_attention_mask)
+                            # 【修复点 1】截取与 Response 对应的 logits
+                            actor_logits = actor_outputs.logits[:, prompt_len - 1 : -1, :]
                             # 假设 get_logprobs 是从 logits 中提取 action 对应 logprob 的函数
-                            new_logprobs = gather_logprobs(actor_outputs.logits, experience['actions'][start_idx:end_idx])
+                            new_logprobs = gather_logprobs(actor_logits, experience['actions'][start_idx:end_idx])
                             
                             # 重要性采样比率 (Importance Sampling Ratio)
                             ratio = torch.exp(new_logprobs - mb_old_logprobs)
@@ -207,15 +222,21 @@ if __name__ == "__main__":
                             # PPO 截断机制 (Clipped Surrogate Objective)
                             pg_loss1 = -mb_advantages * ratio
                             pg_loss2 = -mb_advantages * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
-                            actor_loss = torch.max(pg_loss1, pg_loss2).mean()
+                            # 使用 Mask 计算真实有效 Token 的平均值
+                            actor_loss_unreduced = torch.max(pg_loss1, pg_loss2) * mb_mask
+                            actor_loss = actor_loss_unreduced.sum() / (mb_mask.sum() + 1e-8)
 
                             # ========== 2. 计算 Critic (Value) Loss ==========
-                            new_values = critic(mb_inputs).squeeze(-1)
+                            new_values_full = critic(mb_inputs, attention_mask=mb_attention_mask).squeeze(-1)
+                            # 【修复点 2】截取与 Response 对应的 Values
+                            new_values = new_values_full[:, prompt_len - 1 : -1]
                             # Value Clip 机制，防止 Value 网络更新跨度过大
                             vpredclipped = mb_old_values + torch.clamp(new_values - mb_old_values, -args.cliprange_value, args.cliprange_value)
                             vf_losses1 = (new_values - mb_returns) ** 2
                             vf_losses2 = (vpredclipped - mb_returns) ** 2
-                            critic_loss = 0.5 * torch.max(vf_losses1, vf_losses2).mean()
+
+                            critic_loss_unreduced = 0.5 * torch.max(vf_losses1, vf_losses2) * mb_mask
+                            critic_loss = critic_loss_unreduced.sum() / (mb_mask.sum() + 1e-8)
 
                             # 按累积步数平均 Loss
                             actor_loss_scaled = actor_loss / num_mini_batches
@@ -235,7 +256,6 @@ if __name__ == "__main__":
                         scaler.unscale_(critic_optimizer)
                         torch.nn.utils.clip_grad_norm_(actor.parameters(), args.max_grad_norm)
                         torch.nn.utils.clip_grad_norm_(critic.parameters(), args.max_grad_norm)
-                        
                         # Actor 更新
                         actor_scale_before = scaler.get_scale()
                         scaler.step(actor_optimizer)
@@ -258,6 +278,8 @@ if __name__ == "__main__":
                         if global_update_step % args.log_interval == 0 and is_main_process:
                             log_training_progress(
                                 start_epoch, start_step, step=step, epoch=epoch, epochs=args.epochs,
+                                dataloader_len=len(dataloader),
+                                total_steps=args.epochs * len(dataloader),
                                 loss_val=running_actor_loss.item(), # PPO 主 Loss
                                 aux_loss_val=running_critic_loss.item(), # 将 Critic Loss 作为 Aux 记录
                                 lr=actor_optimizer.param_groups[0]['lr'],
@@ -271,9 +293,15 @@ if __name__ == "__main__":
                         if global_update_step > 0 and global_update_step % args.save_steps == 0 and is_main_process:
                             # 记得在保存逻辑里同时保存 actor 和 critic
                             save_checkpoint(
-                                actor, actor_optimizer, actor_scheduler, scaler, epoch, step, 
-                                checkpoint_path, is_distributed, swanlab_id
+                                actor, actor_optimizer, actor_scheduler, scaler, epoch, step, checkpoint_path, 
+                                is_distributed, swanlab_id,
+                                critic=critic,
+                                critic_optimizer=critic_optimizer,
+                                critic_scheduler=critic_scheduler
                             )
+                # 清理那些已经 backward 过，但仍滞留在显存中的计算图中间变量
+                del actor_outputs, critic_loss, actor_loss, new_logprobs
+                torch.cuda.empty_cache()
 
         # 每个 Epoch 结束后保存权重
         if is_main_process:

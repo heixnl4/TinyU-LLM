@@ -270,11 +270,33 @@ class TinyuModel(nn.Module):
 
     def forward(self, input_ids, past_key_values=None, use_cache=False, attention_mask=None):
         b_size, seq_len = input_ids.shape
-        if hasattr(past_key_values, 'layer'):
-            past_key_values = None
-        
+        start_pos = 0
+
+        if past_key_values is not None:
+            # 情况 A：遇到了新版 HF 的 Cache 对象
+            if hasattr(past_key_values, "get_seq_length"):
+                start_pos = past_key_values.get_seq_length()
+                if start_pos == 0:
+                    past_key_values = None # 空 Cache 视作无历史记录
+                else:
+                    # 强行将 Cache 解包成我们自定义模型能处理的 list of tuples
+                    past_key_values = [past_key_values[i] for i in range(len(self.layers))]
+            
+            # 情况 B：传统的 tuple/list 格式
+            elif isinstance(past_key_values, (list, tuple)) and len(past_key_values) > 0 and past_key_values[0] is not None:
+                # 严谨校验内层结构，防止直接取 [0][0] 报错
+                if isinstance(past_key_values[0], (list, tuple)) and past_key_values[0][0] is not None:
+                    start_pos = past_key_values[0][0].shape[1]
+            else:
+                past_key_values = None
+
         past_key_values = past_key_values or [None] * len(self.layers)
-        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        # if hasattr(past_key_values, 'layer'):
+        #     past_key_values = None
+        
+        # past_key_values = past_key_values or [None] * len(self.layers)
+        # start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         hidden_states = self.dropout(self.embed_tokens(input_ids))
         position_embeddings = (self.freqs_cos[start_pos : start_pos + seq_len], self.freqs_sin[start_pos : start_pos + seq_len])
 
@@ -309,7 +331,7 @@ class TinyuForcausalLM(PreTrainedModel, GenerationMixin):
             self.model.embed_tokens.weight = self.lm_head.weight
 
 
-    def forward(self, input_ids, past_key_values=None, use_cache=False, attention_mask=None, logits_to_keep=0, labels=None):
+    def forward(self, input_ids, past_key_values=None, use_cache=False, attention_mask=None, logits_to_keep=0, labels=None, return_dict=None, **kwargs):
         hidden_states, past_key_values, aux_loss = self.model(input_ids, past_key_values, use_cache, attention_mask)
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -328,9 +350,18 @@ class TinyuForcausalLM(PreTrainedModel, GenerationMixin):
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
+        # 检查 cache 是否真的有数据
+        past_length = 0
+        if past_key_values is not None:
+            if hasattr(past_key_values, "get_seq_length"):
+                past_length = past_key_values.get_seq_length()
+            elif isinstance(past_key_values, (tuple, list)) and len(past_key_values) > 0 and past_key_values[0] is not None:
+                past_length = past_key_values[0][0].shape[1]
+        
         # 如果传入了 past_key_values，说明当前正处于自回归的生成阶段（不是第一步的 Prefill）
         # 此时只需要输入最后一个预测出的 token，以节省计算量
-        if past_key_values is not None:
+        # 只有当 cache 里确实有历史数据时（解码阶段），才截断 input_ids
+        if past_length > 0:
             input_ids = input_ids[:, -1:]
 
         return {

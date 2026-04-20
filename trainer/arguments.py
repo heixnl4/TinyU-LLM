@@ -96,9 +96,9 @@ def parse_ppo_args():
 
     # ================= 1. 基础训练与 PPO 超参数 =================
     parser.add_argument("--epochs", type=int, default=1, help="外层经验收集(Rollout)的总轮数")
-    parser.add_argument("--ppo_epochs", type=int, default=4, help="PPO内层使用同一批数据更新的轮数")
-    parser.add_argument("--rollout_batch_size", type=int, default=16, help="单卡用于生成经验(Rollout)的 Batch Size")
-    parser.add_argument("--accumulation_steps", type=int, default=4, help="PPO阶段的梯度累积步数")
+    parser.add_argument("--ppo_epochs", type=int, default=1, help="PPO内层使用同一批数据更新的轮数")
+    parser.add_argument("--rollout_batch_size", type=int, default=1, help="单卡用于生成经验(Rollout)的 Batch Size")
+    parser.add_argument("--accumulation_steps", type=int, default=1, help="PPO阶段的梯度累积步数")
     
     # 学习率与优化
     parser.add_argument("--actor_learning_rate", type=float, default=1e-5, help="Actor(策略)模型最大学习率，通常较小")
@@ -118,9 +118,9 @@ def parse_ppo_args():
     parser.add_argument("--cliprange_value", type=float, default=0.2, help="Critic 价值更新的截断比率 (Value clip)")
 
     # ================= 2. 模型架构参数 =================
-    parser.add_argument("--hidden_size", type=int, default=512, help="隐藏层维度")
-    parser.add_argument("--num_hidden_layers", type=int, default=4, help="隐藏层层数")
-    parser.add_argument("--num_attention_heads", type=int, default=8, help="注意力头数")
+    parser.add_argument("--hidden_size", type=int, default=64, help="隐藏层维度")
+    parser.add_argument("--num_hidden_layers", type=int, default=2, help="隐藏层层数")
+    parser.add_argument("--num_attention_heads", type=int, default=2, help="注意力头数")
     parser.add_argument("--num_key_value_heads", type=int, default=2, help="KV 头数")
     
     parser.add_argument("--use_moe", action="store_true", help="是否开启 MoE 架构")
@@ -129,17 +129,17 @@ def parse_ppo_args():
 
     # ================= 3. 路径与保存配置 =================
     # PPO 专属路径组
-    parser.add_argument("--data_path", type=str, default="../dataset/ppo_prompts.jsonl", help="PPO Prompt 训练数据集路径")
+    parser.add_argument("--data_path", type=str, default="../dataset/test_data.jsonl", help="PPO Prompt 训练数据集路径")
     parser.add_argument("--actor_model_path", type=str, default="../out/sft_model.pth", help="SFT模型权重路径(用于初始化Actor和Reference)")
     parser.add_argument("--reward_model_path", type=str, default="../out/reward_model.pth", help="奖励模型权重路径(用于初始化Critic和Reward Model)")
     
     # 常规保存路径
     parser.add_argument("--checkpoint_dir", type=str, default="../checkpoints", help="PPO Checkpoint 保存目录")
-    parser.add_argument("--output_dir", type=str, default="../out/ppo", help="PPO 最终权重保存目录")
-    parser.add_argument("--save_steps", type=int, default=500, help="每隔多少次更新保存一次 Checkpoint")
+    parser.add_argument("--output_dir", type=str, default="../out", help="PPO 最终权重保存目录")
+    parser.add_argument("--save_steps", type=int, default=1, help="每隔多少次更新保存一次 Checkpoint")
 
     # ================= 4. 日志与实验追踪 =================
-    parser.add_argument("--log_interval", type=int, default=10, help="每隔多少步打印一次日志(PPO更新步数)")
+    parser.add_argument("--log_interval", type=int, default=1, help="每隔多少步打印一次日志(PPO更新步数)")
     parser.add_argument("--project_name", type=str, default="TinyU-LLM-PPO", help="SwanLab 项目名称")
     parser.add_argument("--run_name", type=str, default="ppo-run-1", help="本次实验名称")
 

@@ -152,7 +152,7 @@ def setup_device_and_distributed():
 def log_training_progress(start_epoch, start_step, step, epoch, epochs, dataloader_len, total_steps, 
                           loss_val, aux_loss_val, lr, start_time, use_swanlab):
     # 1. 计算当前全局进度
-    global_step = step + (epoch * dataloader_len)
+    global_step = step + (epoch * dataloader_len) + 1
     calc_step = global_step if global_step > 0 else 1
 
     # 2. 计算耗时与 ETA
