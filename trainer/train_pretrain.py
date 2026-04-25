@@ -131,9 +131,9 @@ if __name__ == "__main__":
         print(f"使用设备：{device}，是否开启分布式: {is_distributed}")
         print(f"已固定全局随机种子为: {args.seed}")
         if is_loaded:
-            print("未找到 checkpoint，开始从零训练...") 
-        else:
             print(f"已从 checkpoint 中恢复训练，从第 {start_epoch + 1} 个 epoch 和第 {start_step + 1} 个 step 开始训练...")
+        else:
+            print("未找到 checkpoint，开始从零训练...") 
         print(f"{'-'*50}")
         
 

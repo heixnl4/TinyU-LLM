@@ -25,3 +25,5 @@ venv/
 env/
 .env
 
+# 其他
+test.py
