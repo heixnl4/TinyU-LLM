@@ -192,8 +192,14 @@ def generate_experience(actor, critic, ref_model, reward_model, prompt_batch, to
             rm_scores = rm_tensor
         elif rm_tensor.dim() == 2:
             # 情况 B：模型输出的是序列稠密分，形状为 (batch_size, seq_len)
-            # 计算每个 sequence 的实际长度（最后一个非 Pad Token 的索引）
-            last_valid_indices = full_attention_mask.sum(dim=-1) - 1
+            # 修复：获取最后一个有效 token 的真实绝对索引
+            # 构造一个形状相同的递增索引矩阵: [0, 1, 2, ..., seq_len-1]
+            seq_length = full_attention_mask.shape[1]
+            position_ids = torch.arange(seq_length, device=full_attention_mask.device)
+            
+            # 将 mask 为 0 的位置的索引清零，然后取每行的最大值即为最后一个 1 的索引
+            last_valid_indices = (full_attention_mask * position_ids).argmax(dim=-1)
+            
             # 利用 gather 从序列中精准抽出那个最末尾词的得分
             rm_scores = rm_tensor.gather(dim=1, index=last_valid_indices.unsqueeze(-1)).squeeze(-1)
         else:
