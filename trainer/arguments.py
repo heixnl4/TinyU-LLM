@@ -159,12 +159,12 @@ def inference_args():
     parser = argparse.ArgumentParser(description="TinyU-LLM 训练全局参数配置")
 
     parser.add_argument("--epochs", type=int, default=2, help="训练总轮数")
-    
+
     parser.add_argument("--hidden_size", type=int, default=512, help="隐藏层维度")
     parser.add_argument("--num_hidden_layers", type=int, default=4, help="隐藏层层数")
     parser.add_argument("--num_attention_heads", type=int, default=8, help="注意力头数")
     parser.add_argument("--num_key_value_heads", type=int, default=2, help="KV 头数")
-    
+
     parser.add_argument("--use_moe", action="store_true", help="是否开启 MoE 架构")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="模型与 Checkpoint 保存目录")
     parser.add_argument("--output_dir", type=str, default="./out", help="模型与 Checkpoint 保存目录")
@@ -173,3 +173,83 @@ def inference_args():
 
     args = parser.parse_args()
     return args
+
+
+# ================== Web 后端支持：从字典构建 Namespace ==================
+import argparse
+
+def _dict_to_namespace(data: dict, defaults: dict) -> argparse.Namespace:
+    """
+    将前端传来的字典与默认值合并，构建 argparse.Namespace。
+    注意：action='store_true' 的布尔字段，字典中传 None 或 False 时不应触发。
+    """
+    merged = dict(defaults)
+    merged.update(data)
+    ns = argparse.Namespace()
+    for k, v in merged.items():
+        setattr(ns, k, v)
+    return ns
+
+
+def build_pretrain_args_from_dict(data: dict) -> argparse.Namespace:
+    """从前端配置字典构建预训练参数对象。"""
+    defaults = {
+        "epochs": 2,
+        "batch_size": 32,
+        "learning_rate": 5e-4,
+        "seed": 42,
+        "max_length": 512,
+        "grad_clip": 1.0,
+        "accumulation_steps": 4,
+        "dtype": "bfloat16",
+        "hidden_size": 512,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "use_moe": False,
+        "use_compile": False,
+        "use_swanlab": False,
+        "data_path": "./dataset/pretrain_hq.jsonl",
+        "checkpoint_dir": "./checkpoints",
+        "output_dir": "./out",
+        "save_steps": 1000,
+        "log_interval": 100,
+        "project_name": "TinyU-LLM-Pretrain",
+        "run_name": "run-web",
+    }
+    return _dict_to_namespace(data, defaults)
+
+
+def build_sft_args_from_dict(data: dict) -> argparse.Namespace:
+    """从前端配置字典构建 SFT 参数对象。"""
+    defaults = {
+        "epochs": 3,
+        "batch_size": 16,
+        "learning_rate": 5e-5,
+        "seed": 42,
+        "max_length": 512,
+        "grad_clip": 1.0,
+        "accumulation_steps": 4,
+        "dtype": "bfloat16",
+        "hidden_size": 512,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "use_moe": False,
+        "use_compile": False,
+        "use_swanlab": False,
+        "data_path": "./dataset/sft_mini_512_part.jsonl",
+        "checkpoint_dir": "./checkpoints",
+        "output_dir": "./out",
+        "save_steps": 10,
+        "log_interval": 5,
+        "project_name": "TinyU-LLM-SFT",
+        "run_name": "lora-run-web",
+        "pretrain_run_name": "run-web",
+        "pretrained_model_path": None,
+        "lora_rank": 8,
+        "lora_alpha": 32.0,
+        "lora_dropout": 0.1,
+        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    }
+    return _dict_to_namespace(data, defaults)

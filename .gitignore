@@ -27,3 +27,13 @@ env/
 
 # 其他
 test.py
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.cache/
+frontend/*.log
+frontend/.env
+frontend/.env.local
+.DS_Store
