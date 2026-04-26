@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { reactive, ref } from 'vue'
+import { reactive, ref, onMounted, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { startPretrain } from '../api/train'
 import { listDatasets } from '../api/files'
 
 const submitting = ref(false)
 const formRef = ref()
+const STORAGE_KEY = 'tinyu_pretrain_config'
 
-const form = reactive({
+const defaultForm = {
   epochs: 2,
   batch_size: 32,
   learning_rate: 0.0005,
@@ -30,13 +31,33 @@ const form = reactive({
   log_interval: 100,
   project_name: 'TinyU-LLM-Pretrain',
   run_name: 'run-web',
-})
+}
+
+const form = reactive({ ...defaultForm })
 
 const dtypeOptions = [
   { label: 'float16', value: 'float16' },
   { label: 'bfloat16', value: 'bfloat16' },
   { label: 'float32', value: 'float32' },
 ]
+
+// 页面挂载时从 localStorage 恢复配置
+onMounted(() => {
+  const saved = localStorage.getItem(STORAGE_KEY)
+  if (saved) {
+    try {
+      const parsed = JSON.parse(saved)
+      Object.assign(form, parsed)
+    } catch (e) {
+      console.error('恢复配置失败', e)
+    }
+  }
+})
+
+// 监听 form 变化，自动保存到 localStorage
+watch(form, (val) => {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(val))
+}, { deep: true })
 
 async function handleSubmit() {
   submitting.value = true
@@ -60,6 +81,12 @@ async function refreshDatasets() {
   } catch (e) {
     console.error(e)
   }
+}
+
+function resetDefaults() {
+  Object.assign(form, defaultForm)
+  localStorage.removeItem(STORAGE_KEY)
+  ElMessage.success('已恢复默认配置')
 }
 </script>
 
@@ -151,6 +178,10 @@ async function refreshDatasets() {
       <el-button type="primary" size="large" :loading="submitting" @click="handleSubmit">
         <el-icon><VideoPlay /></el-icon>
         启动预训练
+      </el-button>
+      <el-button size="large" @click="resetDefaults">
+        <el-icon><RefreshLeft /></el-icon>
+        恢复默认
       </el-button>
     </el-form-item>
   </el-form>

@@ -55,7 +55,9 @@ function handleSelect(path: string) {
         <h2>{{ route.meta.title || 'TinyU-LLM' }}</h2>
       </el-header>
       <el-main class="app-main">
-        <router-view />
+        <keep-alive>
+          <router-view />
+        </keep-alive>
       </el-main>
     </el-container>
   </el-container>
