@@ -324,3 +324,111 @@ class PromptDataset(Dataset):
             "input_ids": self.dataset[idx]["input_ids"],
             "attention_mask": self.dataset[idx]["attention_mask"]
         }
+    
+
+class DPODataset(Dataset):
+    def __init__(self, file_path, tokenizer, max_prompt_length=256, max_response_length=512):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_prompt_length = max_prompt_length
+        self.max_response_length = max_response_length
+        
+        # 使用 Hugging Face 的 load_dataset 高效加载 JSONL
+        # streaming=False 表示把数据一次性下到本地/内存，适合中小型微调
+        self.data = load_dataset("json", data_files=file_path, split="train")
+        
+        # 确保 tokenizer 有 pad_token，没有的话借用 eos_token
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+    def __len__(self):
+        return len(self.data)
+
+    def _tokenize_and_align(self, prompt_messages, response_messages):
+        """
+        核心逻辑：将 Prompt 和 Response 分别处理并拼接，确保长度精确对齐
+        """
+        # 1. 使用模型的 Chat Template 渲染文本
+        if hasattr(self.tokenizer, "apply_chat_template") and self.tokenizer.chat_template is not None:
+            # 渲染 Prompt（带有生成提示符，例如底部的 "Assistant:"）
+            prompt_text = self.tokenizer.apply_chat_template(
+                prompt_messages, tokenize=False, add_generation_prompt=True
+            )
+            # 渲染 Response（如果是标准的列表，通常取最后一个 assistant 的 content）
+            # 注意这里只取纯文本，因为控制符已经在 prompt_text 里了
+            response_text = response_messages[0]["content"] + self.tokenizer.eos_token
+        else:
+            # Fallback 兼容逻辑：如果没有 chat_template，手动拼一下
+            prompt_text = prompt_messages[0]["content"] + "\nAssistant: "
+            response_text = response_messages[0]["content"] + self.tokenizer.eos_token
+
+        # 2. 分别 Tokenize
+        prompt_tokens = self.tokenizer(prompt_text, add_special_tokens=True)
+        # response 不加 special tokens，防止在中间多出一个 BOS(句子开头符)
+        response_tokens = self.tokenizer(response_text, add_special_tokens=False)
+
+        # 3. 截断处理
+        prompt_input_ids = prompt_tokens["input_ids"]
+        prompt_mask = prompt_tokens["attention_mask"]
+        
+        # 如果 prompt 太长，截断左侧（保留最新的对话上下文）
+        if len(prompt_input_ids) > self.max_prompt_length:
+            prompt_input_ids = prompt_input_ids[-self.max_prompt_length:]
+            prompt_mask = prompt_mask[-self.max_prompt_length:]
+            
+        # 如果 response 太长，截断右侧
+        resp_input_ids = response_tokens["input_ids"]
+        resp_mask = response_tokens["attention_mask"]
+        if len(resp_input_ids) > self.max_response_length:
+            resp_input_ids = resp_input_ids[:self.max_response_length]
+            resp_mask = resp_mask[:self.max_response_length]
+
+        # 4. 拼接
+        input_ids = prompt_input_ids + resp_input_ids
+        attention_mask = prompt_mask + resp_mask
+        prompt_length = len(prompt_input_ids)
+
+        return input_ids, attention_mask, prompt_length
+
+    def __getitem__(self, idx):
+        example = self.data[idx]
+        chosen = example["chosen"]
+        rejected = example["rejected"]
+
+        # 假设 chosen 和 rejected 的对话历史完全一致（除了最后一句 Assistant 的回复）
+        # 切分出 Prompt 部分 (User) 和 Response 部分 (Assistant)
+        prompt_messages = chosen[:-1]
+        chosen_response = chosen[-1:]
+        rejected_response = rejected[-1:]
+
+        # 获取 Chosen 的拼接 Token
+        c_input_ids, c_mask, prompt_len = self._tokenize_and_align(prompt_messages, chosen_response)
+        # 获取 Rejected 的拼接 Token
+        r_input_ids, r_mask, _ = self._tokenize_and_align(prompt_messages, rejected_response)
+
+        # 5. 动态 Padding 到最大长度 (针对当前这一对)
+        max_total_len = self.max_prompt_length + self.max_response_length
+        pad_id = self.tokenizer.pad_token_id
+
+        # 定义一个简单的 padding 内部函数，统一右侧补齐 (Right Padding)
+        def pad_sequence(seq, pad_value):
+            pad_len = max_total_len - len(seq)
+            return seq + [pad_value] * pad_len if pad_len > 0 else seq
+
+        c_input_ids_padded = pad_sequence(c_input_ids, pad_id)
+        c_mask_padded = pad_sequence(c_mask, 0)
+        
+        r_input_ids_padded = pad_sequence(r_input_ids, pad_id)
+        r_mask_padded = pad_sequence(r_mask, 0)
+
+        # 封装为 Tensor 返回
+        return {
+            "chosen_input_ids": torch.tensor(c_input_ids_padded, dtype=torch.long),
+            "chosen_attention_mask": torch.tensor(c_mask_padded, dtype=torch.long),
+            "rejected_input_ids": torch.tensor(r_input_ids_padded, dtype=torch.long),
+            "rejected_attention_mask": torch.tensor(r_mask_padded, dtype=torch.long),
+            "prompt_length": torch.tensor(prompt_len, dtype=torch.long)
+        }
+    
+    

@@ -27,6 +27,7 @@ env/
 
 # 其他
 test.py
+docs/
 
 # 前端
 frontend/node_modules/

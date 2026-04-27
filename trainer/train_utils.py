@@ -149,36 +149,40 @@ def setup_device_and_distributed():
     return device, local_rank, is_distributed, is_main_process
 
 # 日志打印函数
-def log_training_progress(start_epoch, start_step, step, epoch, epochs, dataloader_len, total_steps, 
-                          loss_val, aux_loss_val, lr, start_time, use_swanlab):
+def log_training_progress(start_epoch, start_step, step, epoch, epochs, dataloader_len, total_steps,
+                          loss_val, aux_loss_val, lr, start_time, use_swanlab, reward_acc=None):
     # 1. 计算当前全局进度
     global_step = step + 1 + (epoch * dataloader_len)
     calc_step = global_step if global_step > 0 else 1
 
     # 2. 计算耗时与 ETA
-    elapsed_seconds = time.time() - start_time                     
-    steps_per_second = (calc_step - (start_step + (start_epoch * dataloader_len))) / elapsed_seconds                 
-    remaining_steps = total_steps - global_step                    
-    eta_seconds = remaining_steps / steps_per_second               
+    elapsed_seconds = time.time() - start_time
+    steps_per_second = (calc_step - (start_step + (start_epoch * dataloader_len))) / elapsed_seconds
+    remaining_steps = total_steps - global_step
+    eta_seconds = remaining_steps / steps_per_second
 
     # 3. 格式化为 HH:MM:SS
     elapsed_str = str(datetime.timedelta(seconds=int(elapsed_seconds)))
     eta_str = str(datetime.timedelta(seconds=int(eta_seconds)))
 
     # 4. 打印进度日志
+    acc_str = f" | Reward Acc: {reward_acc:.2%}" if reward_acc is not None else ""
     print(f"Epoch: [{epoch+1}/{epochs}] | Step: [{global_step}/{total_steps}] | "
-          f"Loss: {loss_val:.4f} | Learning_rate: {lr:.6f} | "
+          f"Loss: {loss_val:.4f} | Learning_rate: {lr:.6f}{acc_str} | "
           f"本次训练已耗时: {elapsed_str} | 预计剩余: {eta_str}")
-    
+
     # 5. 上传至 SwanLab
     if use_swanlab:
-        swanlab.log({
+        log_dict = {
             "train/loss": loss_val,
             "train/aux_loss": aux_loss_val,
             "train/learning_rate": lr,
-            "train/step": global_step, 
-            "train/elapsed_hours": elapsed_seconds / 3600 
-        })
+            "train/step": global_step,
+            "train/elapsed_hours": elapsed_seconds / 3600
+        }
+        if reward_acc is not None:
+            log_dict["train/reward_acc"] = reward_acc
+        swanlab.log(log_dict)
 
 
 class SkipStepSampler(Sampler):
