@@ -216,6 +216,53 @@ def parse_grpo_args():
     return args
 
 
+def parse_dpo_args():
+    parser = argparse.ArgumentParser(description="TinyU-LLM DPO 训练全局参数配置")
+
+    # ================= 1. 基础训练与 DPO 超参数 =================
+    parser.add_argument("--epochs", type=int, default=3, help="训练总轮数")
+    parser.add_argument("--batch_size", type=int, default=4, help="单卡 Batch Size (每对 chosen/rejected 算 1 个 batch)")
+    parser.add_argument("--accumulation_steps", type=int, default=4, help="梯度累积步数")
+    
+    parser.add_argument("--learning_rate", type=float, default=5e-6, help="Actor模型最大学习率(DPO的LR通常比SFT还要小)")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="梯度裁剪阈值")
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"], help="训练时使用的精度")
+    parser.add_argument("--seed", type=int, default=42, help="全局随机种子")
+    
+    # 长度控制
+    parser.add_argument("--max_prompt_length", type=int, default=256, help="输入 Prompt 的最大长度")
+    parser.add_argument("--max_response_length", type=int, default=512, help="输入 Response 的最大长度")
+
+    # DPO 专属核心超参数
+    parser.add_argument("--beta", type=float, default=0.1, help="DPO 的温度参数，beta 越大，对偏离 Reference 模型的惩罚越重")
+
+    # ================= 2. 模型架构参数 =================
+    parser.add_argument("--hidden_size", type=int, default=64, help="隐藏层维度")
+    parser.add_argument("--num_hidden_layers", type=int, default=2, help="隐藏层层数")
+    parser.add_argument("--num_attention_heads", type=int, default=2, help="注意力头数")
+    parser.add_argument("--num_key_value_heads", type=int, default=2, help="KV 头数")
+    
+    parser.add_argument("--use_moe", action="store_true", help="是否开启 MoE 架构")
+    parser.add_argument("--use_compile", action="store_true", help="是否开启 torch.compile 加速")
+    parser.add_argument("--use_swanlab", action="store_true", help="是否使用Swanlab")
+
+    # ================= 3. 路径与保存配置 =================
+    # DPO 不需要 Reward Model 和 Critic
+    parser.add_argument("--data_path", type=str, default="../dataset/dpo.jsonl", help="DPO 偏好对数据集路径")
+    parser.add_argument("--actor_model_path", type=str, default="../out/sft_model.pth", help="SFT模型权重路径(用于初始化Actor和Reference)")
+    
+    parser.add_argument("--checkpoint_dir", type=str, default="../checkpoints", help="Checkpoint 保存目录")
+    parser.add_argument("--output_dir", type=str, default="../out", help="最终权重保存目录")
+    parser.add_argument("--save_steps", type=int, default=1, help="每隔多少次更新保存一次 Checkpoint")
+
+    # ================= 4. 日志 =================
+    parser.add_argument("--log_interval", type=int, default=1, help="每隔多少步打印一次日志")
+    parser.add_argument("--project_name", type=str, default="TinyU-LLM-DPO", help="SwanLab 项目名称")
+    parser.add_argument("--run_name", type=str, default="dpo-run-1", help="本次实验名称")
+
+    args = parser.parse_args()
+    return args
+
 
 def inference_args():
     parser = argparse.ArgumentParser(description="TinyU-LLM 训练全局参数配置")
